@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# Deploys VLESS Reality on a VPS from the local machine over SSH:
+# vps-init (user + basic security) → xray → N unique clients → configs downloaded locally.
+# Safe to rerun: finished steps are skipped, clients are topped up to N.
+# Usage:  vpn-deploy <IP> <client count> [SNI, default www.apple.com]
+set -euo pipefail
+
+f=$0; while [ -L "$f" ]; do t=$(readlink "$f"); case $t in /*) f=$t ;; *) f=$(dirname "$f")/$t ;; esac; done
+DEVOPS_DIR=$(cd "$(dirname "$f")/.." && pwd)
+# shellcheck source=SCRIPTDIR/../lib/config.sh
+. "$DEVOPS_DIR/lib/config.sh"
+devops_require DEVOPS_ADMIN || exit 1
+ADMIN=$DEVOPS_ADMIN
+
+die() { echo "Error: $*" >&2; exit 1; }
+[ $# -eq 2 ] || [ $# -eq 3 ] || die "usage: $(basename "$0") <IP> <client count> [SNI]"
+HOST=$1 COUNT=$2 SNI=${3:-www.apple.com}
+[[ $COUNT =~ ^[1-9][0-9]{0,2}$ ]] || die "client count: 1–999"
+# vps-init is looked up next to this script, then in PATH
+VPS_INIT=$(dirname "$0")/vps-init
+[ -x "$VPS_INIT" ] || VPS_INIT=$(command -v vps-init) || die "vps-init not found (next to $0 or in PATH)"
+OUT=$HOME/vpn-configs/$HOST
+SSH=(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+
+# --- 1. user + basic security ---
+echo "=== 1/3 vps-init $HOST ==="
+"$VPS_INIT" "$HOST"
+
+# --- 2. xray + clients ---
+echo "=== 2/3 Xray VLESS Reality, clients: $COUNT ==="
+"${SSH[@]}" "$ADMIN@$HOST" "sudo SERVER_IP=$HOST SNI=$SNI COUNT=$COUNT bash -s" <<'XRAY'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+apt-get install -y -q curl jq openssl qrencode
+CONF_DIR=/usr/local/etc/xray
+CONFIG=$CONF_DIR/config.json
+ENV=$CONF_DIR/client.env
+PORT=443
+FRESH=0
+
+if [ ! -f "$ENV" ]; then
+  FRESH=1
+  if ss -Hltn "sport = :$PORT" | grep -q .; then
+    echo "Port $PORT is taken:" >&2; ss -Hltnp "sport = :$PORT" >&2; exit 1
+  fi
+  # Reality poses as the SNI site: the site must serve TLS 1.3 + HTTP/2
+  v=$(curl -so /dev/null --max-time 10 --tlsv1.3 --http2 -w '%{http_version}' "https://$SNI" || true)
+  [ "$v" = 2 ] || { echo "SNI $SNI does not serve TLS 1.3 + HTTP/2 from this server: pick another one" >&2; exit 1; }
+
+  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+  keys=$(xray x25519)
+  PRIV=$(sed -n 's/^Private[ ]*[Kk]ey: //p' <<<"$keys")
+  PUB=$(sed -n 's/^\(Password (PublicKey)\|Public key\): //p' <<<"$keys")
+  [ -n "$PRIV" ] && [ -n "$PUB" ] || { echo "cannot parse the output of xray x25519:"$'\n'"$keys" >&2; exit 1; }
+  SID=$(openssl rand -hex 8)
+
+  jq -n --arg sni "$SNI" --arg priv "$PRIV" --arg sid "$SID" --argjson port "$PORT" '{
+    log: {loglevel: "warning", access: "none", error: "/var/log/xray/error.log"},
+    api: {tag: "api", services: ["HandlerService", "StatsService"]},
+    stats: {},
+    policy: {levels: {"0": {statsUserOnline: true}}},
+    inbounds: [
+      {tag: "api", listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}},
+      {tag: "vless-in", listen: "0.0.0.0", port: $port, protocol: "vless",
+       settings: {clients: [], decryption: "none"},
+       streamSettings: {network: "tcp", security: "reality",
+         realitySettings: {dest: "\($sni):443", serverNames: [$sni], privateKey: $priv, shortIds: [$sid]}},
+       sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}}
+    ],
+    outbounds: [{tag: "direct", protocol: "freedom"}, {tag: "block", protocol: "blackhole"}],
+    routing: {rules: [
+      {inboundTag: ["api"], outboundTag: "api"},
+      {ip: ["geoip:private"], outboundTag: "block"},
+      {protocol: ["bittorrent"], outboundTag: "block"}
+    ]}
+  }' > "$CONFIG"
+  xray run -test -c "$CONFIG" >/dev/null
+  chown root:nogroup "$CONFIG"; chmod 640 "$CONFIG"
+
+  printf 'SERVER_IP=%s\nPORT=%s\nSNI=%s\nPUBLIC_KEY=%s\nSHORT_ID=%s\n' "$SERVER_IP" "$PORT" "$SNI" "$PUB" "$SID" > "$ENV"
+  chmod 600 "$ENV"
+  ufw allow "$PORT/tcp" >/dev/null
+  systemctl enable -q xray
+  systemctl restart xray
+fi
+
+# On a fresh server step 1 (vps-init) did not see xray yet and turned auto-reboot on
+AUTO_REBOOT=/etc/apt/apt.conf.d/52-auto-reboot
+if [ -e "$AUTO_REBOOT" ]; then
+  rm -f "$AUTO_REBOOT"
+  echo "Auto-reboot removed: VPN node, a restart breaks the tunnels"
+fi
+
+# --- client management ---
+cat > /usr/local/bin/xray-clients <<'CLIENTS'
+#!/usr/bin/env bash
+# VLESS Reality clients: one client = one UUID = one device.
+# Changes apply live through the xray gRPC API, without a restart (tunnels stay up);
+# config.json is edited alongside: the source of truth after a reboot.
+# Client files: /var/lib/xray-clients/<name>.txt (link) and <name>.png (QR).
+# Usage:  sudo xray-clients {add <name>|gen <N> [prefix]|remove <name>|list|show <name>|test <name>|online}
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+
+CONFIG=/usr/local/etc/xray/config.json
+OUT=/var/lib/xray-clients
+API=127.0.0.1:10085
+TAG=vless-in
+FLOW=xtls-rprx-vision
+# SERVER_IP PORT SNI PUBLIC_KEY SHORT_ID
+# shellcheck source=/dev/null
+. /usr/local/etc/xray/client.env
+
+die() { echo "Error: $*" >&2; exit 1; }
+clients() { jq -r --arg t "$TAG" '.inbounds[] | select(.tag == $t) | .settings.clients[].email' "$CONFIG"; }
+exists() { clients | grep -qxF "$1"; }
+uuid_of() { jq -r --arg t "$TAG" --arg n "$1" '.inbounds[] | select(.tag == $t) | .settings.clients[] | select(.email == $n) | .id' "$CONFIG"; }
+uri() { echo "vless://$1@$SERVER_IP:$PORT?encryption=none&flow=$FLOW&security=reality&sni=$SNI&fp=chrome&pbk=$PUBLIC_KEY&sid=$SHORT_ID&type=tcp#$2"; }
+
+# The new config.json is written atomically and only after validation.
+commit() {
+  local tmp; tmp=$(mktemp --suffix=.json)
+  printf '%s\n' "$1" > "$tmp"
+  xray run -test -c "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "the new config failed validation, changes not applied"; }
+  chown root:nogroup "$tmp"; chmod 640 "$tmp"
+  mv "$tmp" "$CONFIG"
+}
+
+add() {
+  local name=$1 id tmp
+  [[ $name =~ ^[A-Za-z0-9._-]{1,32}$ ]] || die "name: 1–32 characters [A-Za-z0-9._-]"
+  exists "$name" && die "client '$name' already exists"
+  id=$(xray uuid)
+  tmp=$(mktemp --suffix=.json)
+  # port is required: without it adu prints "Added 0 user(s)" and still exits 0
+  jq -n --arg t "$TAG" --argjson p "$PORT" --arg id "$id" --arg f "$FLOW" --arg n "$name" \
+    '{inbounds: [{tag: $t, port: $p, protocol: "vless", settings: {clients: [{id: $id, flow: $f, email: $n}], decryption: "none"}}]}' > "$tmp"
+  if ! xray api adu -s "$API" "$tmp" 2>&1 | grep -q 'Added 1 user'; then
+    rm -f "$tmp"; die "xray api adu did not add '$name': is xray running?"
+  fi
+  rm -f "$tmp"
+  commit "$(jq --arg t "$TAG" --arg id "$id" --arg f "$FLOW" --arg n "$name" \
+    '(.inbounds[] | select(.tag == $t) | .settings.clients) += [{id: $id, flow: $f, email: $n}]' "$CONFIG")"
+  install -d -m 700 "$OUT"
+  uri "$id" "$name" > "$OUT/$name.txt"
+  qrencode -o "$OUT/$name.png" < "$OUT/$name.txt"
+  echo "+ $name"
+}
+
+gen() {
+  local n=$1 prefix=${2:-user} i=0 made=0 name
+  [[ $n =~ ^[1-9][0-9]*$ ]] || die "gen: N must be an integer > 0"
+  while [ "$made" -lt "$n" ]; do
+    i=$((i + 1)); name=$(printf '%s-%02d' "$prefix" "$i")
+    exists "$name" && continue
+    add "$name"; made=$((made + 1))
+  done
+}
+
+remove() {
+  exists "$1" || die "no client '$1'"
+  xray api rmu -s "$API" -tag "$TAG" "$1" >/dev/null 2>&1 || true
+  commit "$(jq --arg t "$TAG" --arg n "$1" '(.inbounds[] | select(.tag == $t) | .settings.clients) |= map(select(.email != $n))' "$CONFIG")"
+  rm -f "$OUT/$1.txt" "$OUT/$1.png"
+  echo "- $1 (access revoked)"
+}
+
+show() {
+  local id; id=$(uuid_of "$1"); [ -n "$id" ] || die "no client '$1'"
+  uri "$id" "$1"; echo
+  qrencode -t ANSIUTF8 "$(uri "$id" "$1")"
+}
+
+# A real VLESS connection with the client config through the server: catches an SNI with which
+# the Reality handshake fails even though the site itself answers over TLS 1.3 + HTTP/2.
+test_client() {
+  local id tmp pid code
+  id=$(uuid_of "$1"); [ -n "$id" ] || die "no client '$1'"
+  tmp=$(mktemp --suffix=.json)
+  jq -n --arg id "$id" --arg f "$FLOW" --argjson p "$PORT" --arg sni "$SNI" --arg pbk "$PUBLIC_KEY" --arg sid "$SHORT_ID" '{
+    inbounds: [{listen: "127.0.0.1", port: 10808, protocol: "socks"}],
+    outbounds: [{protocol: "vless",
+      settings: {vnext: [{address: "127.0.0.1", port: $p, users: [{id: $id, encryption: "none", flow: $f}]}]},
+      streamSettings: {network: "tcp", security: "reality",
+        realitySettings: {serverName: $sni, fingerprint: "chrome", publicKey: $pbk, shortId: $sid}}}]
+  }' > "$tmp"
+  xray run -c "$tmp" >/dev/null 2>&1 & pid=$!
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -x socks5h://127.0.0.1:10808 https://www.gstatic.com/generate_204 || true)
+    [ "$code" = 204 ] && break
+  done
+  kill "$pid"; rm -f "$tmp"
+  [ "$code" = 204 ] || die "tunnel through '$1' does not work (HTTP $code)"
+  echo "✓ tunnel through '$1' works"
+}
+
+online() {
+  local e
+  # an offline client: the API answers NotFound with a nonzero code, which is not an error
+  for e in $(clients); do
+    { xray api statsonlineiplist -s "$API" -email "$e" 2>/dev/null || true; } \
+      | jq -r --arg e "$e" '.ips // {} | to_entries[] | "\($e)\t\(.key)\tlast seen \(.value | todate)"'
+  done
+}
+
+case "${1:-}" in
+  add)    [ $# -eq 2 ] || die "add <name>"; add "$2" ;;
+  gen)    [ $# -ge 2 ] || die "gen <N> [prefix]"; gen "$2" "${3:-user}" ;;
+  remove) [ $# -eq 2 ] || die "remove <name>"; remove "$2" ;;
+  list)   clients ;;
+  show)   [ $# -eq 2 ] || die "show <name>"; show "$2" ;;
+  test)   [ $# -eq 2 ] || die "test <name>"; test_client "$2" ;;
+  online) online ;;
+  *)      die "usage: xray-clients {add <name>|gen <N> [prefix]|remove <name>|list|show <name>|test <name>|online}" ;;
+esac
+CLIENTS
+chmod 755 /usr/local/bin/xray-clients
+
+# the API takes a moment to come up after a restart
+for _ in $(seq 20); do xray api lsi -s 127.0.0.1:10085 >/dev/null 2>&1 && break; sleep 0.5; done
+
+have=$(xray-clients list | wc -l)
+if [ "$have" -lt "$COUNT" ]; then xray-clients gen $((COUNT - have)); fi
+
+if ! xray-clients test "$(xray-clients list | head -1)"; then
+  if [ "$FRESH" = 1 ]; then
+    # the configs are not handed out yet: wipe them so a rerun with another SNI starts clean
+    rm -f "$ENV" /var/lib/xray-clients/*
+    systemctl stop xray
+    echo "SNI $SNI does not work for Reality. Rerun vpn-deploy with another SNI." >&2
+  fi
+  exit 1
+fi
+echo "✓ xray: $(systemctl is-active xray), clients: $(xray-clients list | wc -l)"
+XRAY
+
+# --- 3. configs to the local machine ---
+echo "=== 3/3 Configs → $OUT ==="
+mkdir -p "$OUT"; chmod 700 "$OUT"
+"${SSH[@]}" "$ADMIN@$HOST" "sudo tar -C /var/lib/xray-clients -cf - ." | tar -C "$OUT" -xf -
+cat "$OUT"/*.txt > "$OUT/all-links.txt"
+echo
+echo "Done. Each client has a link (.txt) and a QR code (.png) in $OUT"
+echo "v2RayTun: \"+\" → import from clipboard or scan the QR code."
+echo "Manage on the server: ssh $ADMIN@$HOST, then sudo xray-clients {add|gen|remove|list|show|online}"

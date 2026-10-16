@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# First setup of a fresh VPS from the local machine over SSH:
+# a user with a key and sudo → basic security (root closed, ufw, fail2ban,
+# auto-updates with a reboot after them at 04:00 except on VPN nodes, BBR, swap,
+# journal limit, time zone).
+# Safe to rerun: if the $ADMIN login already works, root is not touched.
+# With a name, appends an alias to ~/.ssh/config: then `ssh <name>` instead of `ssh <admin>@<IP>`.
+# Settings (admin, key, ignoreip, time zone): ~/.config/devops/env, see env.example.
+# Usage:  vps-init <IP> [name]
+set -euo pipefail
+
+f=$0; while [ -L "$f" ]; do t=$(readlink "$f"); case $t in /*) f=$t ;; *) f=$(dirname "$f")/$t ;; esac; done
+DEVOPS_DIR=$(cd "$(dirname "$f")/.." && pwd)
+# shellcheck source=SCRIPTDIR/../lib/config.sh
+. "$DEVOPS_DIR/lib/config.sh"
+devops_require DEVOPS_ADMIN || exit 1
+ADMIN=$DEVOPS_ADMIN
+PUBKEY_FILE=$DEVOPS_PUBKEY_FILE
+SSH_CONFIG=${SSH_CONFIG:-$HOME/.ssh/config}
+# fail2ban never bans these addresses: loopback + DEVOPS_IGNOREIP (own servers, home).
+IGNOREIP="127.0.0.1/8 ::1${DEVOPS_IGNOREIP:+ $DEVOPS_IGNOREIP}"
+
+die() { echo "Error: $*" >&2; exit 1; }
+[ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: $(basename "$0") <IP> [name]"
+HOST=$1 NAME=${2:-}
+[ -z "$NAME" ] || [[ $NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "name: Latin letters, digits, . _ -"
+[ -f "$PUBKEY_FILE" ] || die "no public key $PUBKEY_FILE (set DEVOPS_PUBKEY_FILE in $DEVOPS_CONFIG)"
+PUBKEY=$(cat "$PUBKEY_FILE")
+SSH=(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+
+admin_ok() { "${SSH[@]}" -o BatchMode=yes "$ADMIN@$HOST" sudo -n true 2>/dev/null; }
+
+# --- 1. user with a key and sudo (the only step as root) ---
+if admin_ok; then
+  echo "=== 1/2 $ADMIN@$HOST already works, root not needed ==="
+else
+  echo "=== 1/2 Creating $ADMIN (root@$HOST) ==="
+  "${SSH[@]}" "root@$HOST" "ADMIN=$ADMIN PUBKEY=$(printf %q "$PUBKEY") bash -s" <<'BOOTSTRAP'
+set -euo pipefail
+id "$ADMIN" &>/dev/null || useradd -m -s /bin/bash -G sudo "$ADMIN"
+install -d -m 700 -o "$ADMIN" -g "$ADMIN" "/home/$ADMIN/.ssh"
+AK=/home/$ADMIN/.ssh/authorized_keys
+touch "$AK"
+grep -qxF "$PUBKEY" "$AK" || echo "$PUBKEY" >> "$AK"
+chmod 600 "$AK"; chown "$ADMIN:$ADMIN" "$AK"
+echo "$ADMIN ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$ADMIN"
+chmod 440 "/etc/sudoers.d/$ADMIN"
+visudo -cqf "/etc/sudoers.d/$ADMIN"
+BOOTSTRAP
+  # root is closed only after the $ADMIN login is verified
+  admin_ok || die "key login $ADMIN@$HOST does not work: root is NOT closed, fix it by hand"
+fi
+
+# --- 2. basic security ---
+echo "=== 2/2 Basic security ==="
+"${SSH[@]}" "$ADMIN@$HOST" "sudo ADMIN=$ADMIN IGNOREIP=$(printf %q "$IGNOREIP") SET_TZ=$(printf %q "$DEVOPS_TZ") bash -s" <<'HARDEN'
+set -euo pipefail
+# otherwise needrestart on Ubuntu opens a TUI and hangs apt
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+warn() { echo "Warning: $*" >&2; }
+# First VPN signal on this host, or nothing: a restart tears down the tunnels,
+# so such a host must not reboot itself. Same text in vps-init and check.sh.
+vpn_signal() {
+  local s
+  s=$(systemctl list-unit-files --no-legend 'xray*.service' 'x-ui.service' 's-ui.service' 'amnezia*.service' \
+    'wg-quick@?*.service' 'awg-quick@?*.service' 2>/dev/null | awk 'NR==1{print $1}' || true)
+  [ -z "$s" ] || { echo "systemd:$s"; return 0; }
+  if command -v docker >/dev/null 2>&1; then
+    s=$(docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -iE -m1 'xray|amnezia|awg|wireguard|x-ui|s-ui' | cut -d' ' -f1 || true)
+    [ -z "$s" ] || { echo "docker:$s"; return 0; }
+  fi
+  for s in /sys/class/net/wg[0-9]* /sys/class/net/awg[0-9]* /usr/local/s-ui /usr/local/x-ui /usr/local/etc/xray /opt/amnezia; do
+    [ -e "$s" ] || continue
+    case $s in /sys/*) echo "iface:${s##*/}" ;; *) echo "path:$s" ;; esac
+    return 0
+  done
+  if command -v xray >/dev/null 2>&1; then echo "bin:xray"; fi
+  return 0
+}
+apt-get update -q
+# Docker is not upgraded on a live server: a daemon restart takes the sites down (old Traefik).
+installed() { [ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" = installed ]; }
+HELD=()
+if installed docker-ce; then
+  for p in docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras; do
+    if installed "$p" && ! apt-mark showhold | grep -qxF "$p"; then
+      apt-mark hold "$p" >/dev/null; HELD+=("$p")
+    fi
+  done
+  # the hold is released even if the upgrade fails
+  trap '[ ${#HELD[@]} -eq 0 ] || apt-mark unhold "${HELD[@]}" >/dev/null' EXIT
+fi
+apt-get upgrade -y -q -o Dpkg::Options::=--force-confold
+if installed docker-ce; then
+  [ ${#HELD[@]} -eq 0 ] || apt-mark unhold "${HELD[@]}" >/dev/null
+  HELD=(); trap - EXIT
+  warn "Docker was not upgraded: upgrade it in a maintenance window"
+fi
+apt-get install -y -q curl jq ufw fail2ban unattended-upgrades
+
+# sshd: drop-in named 00-: sshd takes the first value, and this file comes before the cloud-init ones.
+# AllowUsers keeps users added later (deployer from web-init): a rerun does not drop them.
+HARD=/etc/ssh/sshd_config.d/00-hardening.conf
+# shellcheck disable=SC2046  # space-separated list of names, splitting is intended
+ALLOW=$(printf '%s\n' "$ADMIN" $(sed -n 's/^AllowUsers //p' "$HARD" 2>/dev/null) | awk '!seen[$0]++' | xargs)
+cat > "$HARD" <<EOF
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+MaxAuthTries 3
+X11Forwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+AllowUsers $ALLOW
+EOF
+# Without Include in sshd_config the drop-in is silently ignored. Include goes on the first line:
+# the first value wins, and the directives of the main file stay as they are.
+INC_RE='^[[:space:]]*Include[[:space:]]+(/etc/ssh/)?sshd_config\.d/\*\.conf([[:space:]]|$)'
+if ! grep -qiE "$INC_RE" /etc/ssh/sshd_config; then
+  sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+  echo "sshd_config: added Include /etc/ssh/sshd_config.d/*.conf"
+fi
+mkdir -p /run/sshd
+sshd -t || { rm "$HARD"; echo "sshd -t failed, drop-in removed" >&2; exit 1; }
+# Ubuntu 24.04: ssh.socket reads the new config on the next connection
+systemctl try-reload-or-restart ssh
+EFF=$(sshd -T)
+grep -qxF "allowusers $ADMIN" <<<"$EFF" && grep -qxF 'permitrootlogin no' <<<"$EFF" \
+  && grep -qxF 'passwordauthentication no' <<<"$EFF" \
+  || { echo "Error: sshd -T: hardening did not apply (need allowusers $ADMIN, permitrootlogin no, passwordauthentication no)" >&2; exit 1; }
+
+ufw default deny incoming >/dev/null
+ufw default allow outgoing >/dev/null
+ufw allow 22/tcp >/dev/null
+ufw --force enable >/dev/null
+
+cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 3
+bantime.increment = true
+ignoreip = $IGNOREIP
+
+[sshd]
+enabled = true
+# Ubuntu 22.04+ without rsyslog has no auth.log: read journald
+backend = systemd
+EOF
+systemctl enable -q fail2ban
+systemctl restart fail2ban
+
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+# Kernel updates take effect only after a reboot. VPN nodes reboot by hand.
+AUTO_REBOOT=/etc/apt/apt.conf.d/52-auto-reboot
+VPN=$(vpn_signal)
+if [ -n "$VPN" ]; then
+  rm -f "$AUTO_REBOOT"
+  REBOOT="auto-reboot: off (VPN node, $VPN)"
+  echo "Auto-reboot skipped: VPN node ($VPN), a restart breaks the tunnels"
+else
+  cat > "$AUTO_REBOOT" <<'EOF'
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+EOF
+  REBOOT="auto-reboot: 04:00"
+fi
+
+# swap 2G only if there is no swap yet; it goes to fstab after a successful swapon
+SWAP="swap: already present"
+if [ -z "$(swapon --show --noheadings)" ]; then
+  [ -f /swapfile ] || { fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap -q /swapfile; }
+  if swapon /swapfile; then
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    SWAP="swap: 2G /swapfile"
+  else
+    rm -f /swapfile
+    SWAP="swap: not enabled"
+    warn "swapon failed (container?): swap not enabled"
+  fi
+fi
+echo 'vm.swappiness = 10' > /etc/sysctl.d/90-swap.conf
+
+cat > /etc/sysctl.d/90-bbr.conf <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+sysctl -q --system || warn "sysctl: BBR/swappiness not applied (kernel/container), not critical"
+
+mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=200M\n' > /etc/systemd/journald.conf.d/size.conf
+systemctl restart systemd-journald
+
+TZ_SET="TZ: unchanged"
+if [ -n "$SET_TZ" ]; then
+  if timedatectl set-timezone "$SET_TZ"; then TZ_SET="TZ: $SET_TZ"; else warn "timedatectl failed (container?): time zone unchanged"; fi
+fi
+
+echo "✓ root closed, passwords off, ufw: 22/tcp, fail2ban: sshd + ignoreip, auto-updates, $REBOOT, BBR, $SWAP, swappiness 10, journal ≤200M, $TZ_SET"
+HARDEN
+
+# --- alias in ~/.ssh/config ---
+# The block is appended at the end, even after `Host *`: ssh takes the first value of each
+# option, and `Host *` sets no HostName or User, so they come from this block.
+if [ -n "$NAME" ]; then
+  if grep -qE "^Host[[:space:]]+${NAME//./\\.}[[:space:]]*$" "$SSH_CONFIG" 2>/dev/null; then
+    echo "✓ $SSH_CONFIG: Host $NAME already present, left as is"
+  else
+    [ -f "$SSH_CONFIG" ] || install -m 600 /dev/null "$SSH_CONFIG"
+    [ -s "$SSH_CONFIG" ] && [ -n "$(tail -c1 "$SSH_CONFIG")" ] && echo >> "$SSH_CONFIG"
+    printf 'Host %s\n  HostName %s\n  User %s\n' "$NAME" "$HOST" "$ADMIN" >> "$SSH_CONFIG"
+    echo "✓ $SSH_CONFIG: Host $NAME → $ADMIN@$HOST"
+  fi
+fi

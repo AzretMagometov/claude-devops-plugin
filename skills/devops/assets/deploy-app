@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Rollout of one project on a server shared by several. Installed by web-init
+# as /usr/local/bin/deploy-app (root:root 755) and run only as the forced
+# command of a deployer key, one line per project in
+# /home/deployer/.ssh/authorized_keys:
+#
+#   restrict,command="/usr/local/bin/deploy-app <app>" ssh-ed25519 AAAA... <app>-deploy@forgejo
+#
+# The project name comes from that line, which belongs to root. The caller
+# sends only SSH_ORIGINAL_COMMAND, and it must be exactly `deploy <40-hex>`.
+#
+# Layout (scripts/add-project.sh creates it):
+#
+#   /opt/<app>                root:root 755       deployer cannot replace files in it
+#   /opt/<app>/.env           root:deployer 640   read, never written
+#   /opt/<app>/state          deployer 755        the only place deployer writes:
+#                             last-known-good, deploy.log, deploy.lock,
+#                             pre-deploy.sql.gz, docker/ (registry login)
+#   /home/deployer, .ssh      root:root 755       deployer cannot swap its keys
+#   .ssh/authorized_keys      root:root 644
+#
+# Variables read from .env (never sourced):
+#   IMAGE            required; image without tag, <registry>/<owner>/<name>;
+#                    the registry host is its first path segment
+#   REGISTRY_TOKEN   required; read:package token for the registry
+#   REGISTRY_USER    registry login, default the <owner> segment of IMAGE
+#
+# The compose file comes from the image (/app/docker-compose.yml), so a tag
+# means code and stack layout at once and a rollback brings the old stack back.
+# /opt/<app>/docker-compose.yml is the fallback for images without it.
+# Compose gets IMAGE and IMAGE_TAG in the environment, which wins over .env.
+set -euo pipefail
+
+HEALTH_TIMEOUT=180
+COMPOSE_IN_IMAGE=/app/docker-compose.yml
+
+log() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+# --- project --------------------------------------------------------------
+[[ $# -eq 1 ]] || die "usage: deploy-app <app> (from authorized_keys)"
+APP=$1
+[[ $APP =~ ^[a-z0-9][a-z0-9_-]{0,40}$ ]] || die "project name \"${APP}\" does not match ^[a-z0-9][a-z0-9_-]{0,40}$"
+PROJECT_DIR=/opt/$APP
+STATE_DIR=$PROJECT_DIR/state
+cd "$PROJECT_DIR" 2>/dev/null || die "no directory ${PROJECT_DIR}"
+[[ -w $STATE_DIR ]] || die "${STATE_DIR} is not writable"
+
+# Everything sent to the CI session is copied into state/deploy.log: the step
+# log of Forgejo Actions is not readable through the API.
+exec 2> >(tee -a "$STATE_DIR/deploy.log" >&2)
+printf '\n=== %s  %s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$APP" "${SSH_ORIGINAL_COMMAND:-<empty>}" >&2
+
+# --- command --------------------------------------------------------------
+# The whole string is matched: no second word, no extra spaces, no moving
+# names like latest. A tag means one image forever.
+[[ ${SSH_ORIGINAL_COMMAND:-} =~ ^deploy\ ([0-9a-f]{40})$ ]] \
+  || die "expected \"deploy <tag>\", got: ${SSH_ORIGINAL_COMMAND:-<empty>}"
+TAG=${BASH_REMATCH[1]}
+
+# CI serialises rollouts of one repository; this lock is the backstop for a
+# manual run racing a push. A second run fails at once instead of queueing a
+# stale tag.
+exec 9> "$STATE_DIR/deploy.lock"
+flock -n 9 || die "another rollout of ${APP} is running, retry later"
+
+# --- .env -----------------------------------------------------------------
+[[ -r .env ]] || die "cannot read ${PROJECT_DIR}/.env"
+env_get() {
+  local v
+  v=$(grep -E "^$1=" .env | tail -n1 | cut -d= -f2-) || true
+  [[ $v =~ ^\"(.*)\"$ || $v =~ ^\'(.*)\'$ ]] && v=${BASH_REMATCH[1]}
+  printf '%s' "$v"
+}
+IMAGE=$(env_get IMAGE)
+[[ -n $IMAGE ]] || die "no IMAGE in ${PROJECT_DIR}/.env (form <registry>/<owner>/${APP})"
+REGISTRY=${IMAGE%%/*}
+REGISTRY_USER=$(env_get REGISTRY_USER)
+# Forgejo: the owner of the package path logs in as itself.
+[[ -n $REGISTRY_USER || ! $IMAGE =~ ^[^/]+/([^/]+)/ ]] || REGISTRY_USER=${BASH_REMATCH[1]}
+[[ -n $REGISTRY_USER ]] || die "no REGISTRY_USER in ${PROJECT_DIR}/.env, and IMAGE=${IMAGE} has no owner"
+TOKEN=$(env_get REGISTRY_TOKEN)
+[[ -n $TOKEN ]] || die "no REGISTRY_TOKEN in ${PROJECT_DIR}/.env"
+
+STATE_FILE=$STATE_DIR/last-known-good
+PREVIOUS=$(cat "$STATE_FILE" 2>/dev/null || true)
+log "rollout ${APP} ${TAG} (now ${PREVIOUS:-<unknown>})"
+
+# --- registry -------------------------------------------------------------
+# Credentials per project, inside state/: projects on one server log in as
+# different users, and the deployer home stays root-owned.
+export DOCKER_CONFIG=$STATE_DIR/docker
+printf '%s' "$TOKEN" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin > /dev/null \
+  || die "registry ${REGISTRY} refused the login"
+
+# --- image and its compose file -------------------------------------------
+# A tag missing from the registry shows here, before any container changes.
+docker pull --quiet "${IMAGE}:${TAG}" > /dev/null || die "image ${IMAGE}:${TAG} did not download; production untouched"
+
+compose_file() {
+  docker run --rm --entrypoint cat "${IMAGE}:$1" "$COMPOSE_IN_IMAGE" 2>/dev/null || {
+    log "image $1 has no ${COMPOSE_IN_IMAGE}, using ${PROJECT_DIR}/docker-compose.yml"
+    cat "$PROJECT_DIR/docker-compose.yml"
+  }
+}
+
+# The compose file arrives on stdin, so the project name is given explicitly:
+# volumes are bound to <app>_*.
+compose() {
+  compose_file "$1" | IMAGE="$IMAGE" IMAGE_TAG="$1" docker compose \
+    --project-name "$APP" \
+    --project-directory "$PROJECT_DIR" \
+    --env-file "$PROJECT_DIR/.env" \
+    -f - "${@:2}"
+}
+
+compose "$TAG" pull --quiet || die "stack images for ${TAG} did not download; production untouched"
+
+# --- database dump before migrations --------------------------------------
+# One rolling file, overwritten by every rollout: the state just before the
+# migrate service of this tag touches the schema. The dump runs in the running
+# postgres container as its POSTGRES_USER and covers every database of the
+# cluster except templates: a project may keep a second database there, as
+# an error tracker keeps its own. Each database is a `pg_dump --clean --if-exists`
+# after a `\connect` to it, so psql restores the whole file over the live
+# cluster from any database. Not pg_dumpall: its --clean drops the databases
+# and the role in use, which fails on a live cluster. Mode 600: the data stays
+# deployer's. A failed dump of any database stops the rollout: a migration
+# without a way back is not started.
+PG=$(docker ps -q --filter "label=com.docker.compose.project=${APP}" \
+  --filter label=com.docker.compose.service=postgres --filter status=running)
+if [[ -z $PG ]]; then
+  log "postgres of ${APP} not running: pre-deploy dump skipped"
+else
+  # The list is read before the loop: `set -e` does not see a failed command
+  # substitution in a `for` word list.
+  # shellcheck disable=SC2016 # expanded by sh in the container
+  docker exec "$PG" sh -c 'set -e
+      dbs=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+        "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY 1")
+      [ -n "$dbs" ]
+      for db in $dbs; do
+        printf "%s\n" "\\connect \"$db\""
+        pg_dump --clean --if-exists -U "$POSTGRES_USER" -d "$db"
+      done' \
+    | (umask 077 && gzip > "$STATE_DIR/pre-deploy.sql.gz.tmp") \
+    || die "pg_dump failed; production untouched"
+  mv "$STATE_DIR/pre-deploy.sql.gz.tmp" "$STATE_DIR/pre-deploy.sql.gz"
+  log "dump of all databases: ${STATE_DIR}/pre-deploy.sql.gz ($(du -h "$STATE_DIR/pre-deploy.sql.gz" | cut -f1))"
+fi
+
+# --- rollout --------------------------------------------------------------
+# `up --wait` starts services in dependency order: the one-shot migrate
+# finishes before the app starts. Health is the container healthcheck, not a
+# request through Traefik, which answers 404 for an unhealthy container.
+if compose "$TAG" up -d --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
+  echo "$TAG" > "$STATE_FILE"
+  log "rollout succeeded, ${TAG} recorded as last known good"
+  docker image prune -f > /dev/null
+  exit 0
+fi
+
+# --- rollback -------------------------------------------------------------
+# The schema stays: rollback works because migrations are compatible with the
+# previous image, and its migrate command exits 0 on a database ahead of it
+# (references/migration-patterns.md). pre-deploy.sql.gz is there for the case
+# when they are not.
+log "stack not healthy in ${HEALTH_TIMEOUT}s, rolling back to ${PREVIOUS:-<nothing>}"
+compose "$TAG" logs --tail 40 --no-color >&2 || true
+
+[[ -n $PREVIOUS ]] \
+  || die "no previous tag, nothing to roll back to: needs a human"
+
+if compose "$PREVIOUS" up -d --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
+  die "rollout of ${TAG} failed, ${APP} rolled back to ${PREVIOUS}"
+fi
+die "rollout of ${TAG} failed AND the rollback to ${PREVIOUS} did not come up: needs a human"

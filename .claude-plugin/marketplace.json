@@ -1,0 +1,14 @@
+{
+  "name": "devops-vps",
+  "description": "Single-plugin marketplace for the devops plugin.",
+  "owner": {
+    "name": "Azret Magometov"
+  },
+  "plugins": [
+    {
+      "name": "devops",
+      "source": ".",
+      "description": "Put a project on a VPS in layers: server hardening, Docker and Traefik, per-project deploy over SSH from Forgejo Actions or GitHub Actions; xray VPN servers."
+    }
+  ]
+}

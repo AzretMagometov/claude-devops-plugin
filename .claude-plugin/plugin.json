@@ -1,0 +1,10 @@
+{
+  "name": "devops",
+  "version": "0.1.0",
+  "description": "Put a project on a VPS in layers: server hardening, Docker and Traefik, per-project deploy over SSH from Forgejo Actions or GitHub Actions; xray VPN servers.",
+  "author": {
+    "name": "Azret Magometov"
+  },
+  "license": "MIT",
+  "keywords": ["devops", "vps", "deploy", "docker", "traefik", "forgejo", "github-actions", "vpn", "xray"]
+}

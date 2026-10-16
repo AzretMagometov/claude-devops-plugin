@@ -1,0 +1,161 @@
+# Project stack: app, the one-shot migrate step, postgres, redis.
+#
+# Adapt to the project:
+#   - `x-app-environment`: the variables the application reads;
+#   - `migrate.command`: the migration command of the stack
+#     (references/migration-patterns.md); no database → delete migrate and postgres;
+#   - `app.healthcheck`: a probe that runs with what the image carries;
+#   - the port in `loadbalancer.server.port`;
+#   - redis: delete the service and REDIS_URL when the project has no use for it.
+#
+# Traefik is not part of the stack: the server runs one Traefik for every
+# project in /opt/traefik (web-init), and `app` joins its external `proxy`
+# network. Router, service and middleware names are global for that Traefik,
+# so every name carries ${COMPOSE_PROJECT_NAME}: two projects with an
+# unprefixed `app` router make Traefik drop both.
+#
+# COMPOSE_PROJECT_NAME comes from .env (or --project-name of the deploy
+# script). It equals the Forgejo repository name: the image path is built from
+# it, and the volume postgres_data is bound to it — a different name starts
+# with an empty database. The service holding the database is named `postgres`:
+# deploy-app dumps it by that name before every rollout.
+#
+# The file ships inside the image as /app/docker-compose.yml: the
+# deploy script reads it from the tag it rolls out, so a rollback brings back
+# the matching stack too.
+
+# Variables without a working default are ${NAME:?}: compose turns a missing
+# variable into an empty string, and the app would start and fail later.
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+  REDIS_URL: redis://redis:6379/0
+
+# One machine, no log collector: without a ceiling a restarting container
+# fills the disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-application: &application
+  # deploy-app passes IMAGE and IMAGE_TAG in the environment on every rollout.
+  image: ${IMAGE:?}:${IMAGE_TAG:?}
+  environment: *app-environment
+  logging: *logging
+  # Nothing is written into the container; scratch space is tmpfs.
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - backend
+
+services:
+  # Runs to completion before app starts, on every `up`. A migration that is
+  # already applied does nothing. A failed migration keeps app on the old image.
+  # A database at a revision this image does not know is ahead of it (a
+  # rollback after a release with a migration): exit 0 with a log line, the
+  # schema is compatible with this image (references/migration-patterns.md).
+  # `alembic heads` runs first, without the database: a broken revision graph
+  # gives the same "Can't locate revision" and must still fail.
+  migrate:
+    <<: *application
+    command:
+      - sh
+      - -c
+      - |
+        alembic heads > /dev/null || exit 1
+        if ! out=$$(alembic current 2>&1); then
+          printf '%s\n' "$$out" >&2
+          case $$out in
+            *"locate revision identified by"*)
+              echo "migrate: the database revision is newer than this image: schema ahead, migrations skipped" >&2
+              exit 0 ;;
+          esac
+          exit 1
+        fi
+        exec alembic upgrade head
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    <<: *application
+    restart: unless-stopped
+    # proxy: the server Traefik reaches app here. backend: app reaches
+    # postgres and redis here. A merge key does not merge lists, so both are named.
+    networks:
+      - proxy
+      - backend
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # The deploy script waits on this healthcheck (`up --wait`), not on a
+    # request through Traefik: Traefik answers 404 for an unhealthy container.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}.rule=Host(`${SITE_DOMAIN:?}`)"
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.entrypoints=websecure
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls.certresolver=letsencrypt
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.service=${COMPOSE_PROJECT_NAME}
+      - traefik.http.services.${COMPOSE_PROJECT_NAME}.loadbalancer.server.port=8000
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+    volumes:
+      # postgres 18 declares /var/lib/postgresql as its volume and keeps the
+      # cluster in a versioned directory below it.
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging: *logging
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging: *logging
+
+volumes:
+  postgres_data:
+
+networks:
+  # Created once per server by web-init. The server Traefik and the routed
+  # service of each project join it, nothing else.
+  proxy:
+    external: true
+  # This project's data network, named <project>_backend by compose. Not
+  # shared: two projects with a `postgres` service on one network make Docker
+  # DNS answer with both addresses. Not internal: app and workers keep
+  # outbound internet access through it.
+  backend:

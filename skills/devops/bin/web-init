@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# Web layer of a server on top of vps-init, from the local machine over SSH:
+# Docker CE → daemon.json (log rotation, live-restore) → network proxy →
+# Traefik stack /opt/traefik (traefik + socket-proxy) → ufw 80/443 →
+# user deployer (no sudo, group docker, in AllowUsers, ~/.ssh owned by root) →
+# /usr/local/bin/deploy-app → weekly image prune.
+# deploy-app comes from the devops skill (DEPLOY_APP_SRC), its only source; installed when it differs.
+# Each project adds its own deployer key with a forced command (devops/scripts/add-project.sh), not this script.
+# Safe to rerun: finished steps are skipped, other containers are left alone.
+# Usage:  web-init <IP or ssh alias> [email for Let's Encrypt, default DEVOPS_ACME_EMAIL]
+# Settings: ~/.config/devops/env, see env.example.
+set -euo pipefail
+
+f=$0; while [ -L "$f" ]; do t=$(readlink "$f"); case $t in /*) f=$t ;; *) f=$(dirname "$f")/$t ;; esac; done
+DEVOPS_DIR=$(cd "$(dirname "$f")/.." && pwd)
+# shellcheck source=SCRIPTDIR/../lib/config.sh
+. "$DEVOPS_DIR/lib/config.sh"
+devops_require DEVOPS_ADMIN || exit 1
+ADMIN=$DEVOPS_ADMIN
+
+die() { echo "Error: $*" >&2; exit 1; }
+[ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: $(basename "$0") <IP or alias> [acme-email]"
+[ $# -eq 2 ] || devops_require DEVOPS_ACME_EMAIL || exit 1
+HOST=$1 ACME_EMAIL=${2:-$DEVOPS_ACME_EMAIL}
+[[ $ACME_EMAIL =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "invalid email: $ACME_EMAIL"
+DEPLOY_APP_SRC=${DEPLOY_APP_SRC:-$DEVOPS_DIR/assets/deploy-app}
+[ -f "$DEPLOY_APP_SRC" ] || die "no $DEPLOY_APP_SRC (devops skill): set DEPLOY_APP_SRC=..."
+SSH=(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+
+"${SSH[@]}" -o BatchMode=yes "$ADMIN@$HOST" sudo -n true 2>/dev/null \
+  || die "$ADMIN@$HOST has no key login with sudo: run vps-init <IP> first"
+
+echo "=== web-init $HOST ==="
+# macOS sends LC_CTYPE=UTF-8 over SSH, which Linux lacks: perl inside systemctl enable would print warnings
+"${SSH[@]}" "$ADMIN@$HOST" "sudo LC_ALL=C.UTF-8 ADMIN=$ADMIN ACME_EMAIL=$(printf %q "$ACME_EMAIL") DEPLOY_APP_B64=$(base64 < "$DEPLOY_APP_SRC" | tr -d '\n') bash -s" <<'WEB'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+die() { echo "Error: $*" >&2; exit 1; }
+CHANGED=()
+HARD=/etc/ssh/sshd_config.d/00-hardening.conf
+[ -f "$HARD" ] || die "no $HARD: run vps-init first"
+
+# --- 1. Docker CE from the official repository ---
+PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+ok=$(dpkg-query -W -f='${Status}\n' "${PKGS[@]}" 2>/dev/null | grep -cx 'install ok installed' || true)
+if [ "$ok" -ne ${#PKGS[@]} ]; then
+  # The repository is already added by another file (another keyring): a second one would conflict on Signed-By
+  if ! grep -rqs 'download.docker.com' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+    apt-get update -q
+    apt-get install -y -q ca-certificates curl
+    install -d -m 755 /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    # shellcheck source=/dev/null
+    . /etc/os-release
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME:-$VERSION_CODENAME} stable" \
+      > /etc/apt/sources.list.d/docker.list
+  fi
+  apt-get update -q
+  apt-get install -y -q "${PKGS[@]}"
+  CHANGED+=("docker")
+fi
+command -v jq >/dev/null || apt-get install -y -q jq
+systemctl enable -q --now docker
+
+# --- 2. daemon.json: add our keys, keep the others ---
+DJ=/etc/docker/daemon.json
+WANT='{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"},"live-restore":true}'
+OLD=$(jq -S . "$DJ" 2>/dev/null || echo '{}')
+[ -s "$DJ" ] && ! jq -e . "$DJ" >/dev/null 2>&1 && die "$DJ is not JSON, fix it by hand"
+NEW=$(jq -S --argjson w "$WANT" '. * $w' <<<"$OLD")
+if [ "$OLD" != "$NEW" ]; then
+  install -d -m 755 /etc/docker
+  printf '%s\n' "$NEW" > "$DJ"
+  # live-restore applies only after a restart, and it is what keeps the containers running
+  systemctl restart docker
+  CHANGED+=("daemon.json")
+fi
+
+# --- 3. docker group for the admin ---
+id -nG "$ADMIN" | grep -qw docker || { usermod -aG docker "$ADMIN"; CHANGED+=("$ADMIN→docker"); }
+
+# --- 4. shared network proxy ---
+docker network inspect proxy >/dev/null 2>&1 || { docker network create proxy >/dev/null; CHANGED+=("network proxy"); }
+
+# --- 5. Traefik stack /opt/traefik ---
+# 80/443 must be free or taken by this same stack (compose project traefik)
+if ss -Hltn '( sport = :80 or sport = :443 )' | grep -q .; then
+  for p in 80 443; do
+    ss -Hltn "sport = :$p" | grep -q . || continue
+    holders=$(docker ps --filter "publish=$p" --format '{{.Label "com.docker.compose.project"}}' | sort -u)
+    [ "$holders" = traefik ] && continue
+    echo "Port $p is taken by something other than /opt/traefik:" >&2
+    docker ps --filter "publish=$p" --format '  container {{.Names}} (project {{.Label "com.docker.compose.project"}})' >&2
+    ss -Hltnp "sport = :$p" >&2
+    die "free port $p yourself (for example, remove traefik from the project compose) and rerun web-init"
+  done
+fi
+install -d -m 755 -o root -g root /opt/traefik
+COMPOSE=/opt/traefik/compose.yml
+TMP=$(mktemp)
+# The template is a copy from devops/references/docker-traefik.md; change both together
+cat > "$TMP" <<'YAML'
+name: traefik
+
+services:
+  traefik:
+    image: traefik:v3.6
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      # Read-only Docker API via socket-proxy, never the raw socket
+      - --providers.docker.endpoint=tcp://socket-proxy:2375
+      - --providers.docker.exposedByDefault=false
+      # Routed containers also sit on their project backend network;
+      # Traefik must reach them over proxy
+      - --providers.docker.network=proxy
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --log.level=INFO
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Named volume: Traefik creates acme.json inside with mode 600 itself
+      - certificates:/letsencrypt
+    networks:
+      - proxy
+      - socket
+    depends_on:
+      - socket-proxy
+
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: unless-stopped
+    environment:
+      # Traefik reads container labels and networks; everything else stays refused
+      CONTAINERS: 1
+      NETWORKS: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - socket
+
+volumes:
+  certificates:
+
+networks:
+  proxy:
+    external: true
+  socket:
+    internal: true
+YAML
+cmp -s "$TMP" "$COMPOSE" || { install -m 644 -o root -g root "$TMP" "$COMPOSE"; CHANGED+=("compose.yml"); }
+printf 'ACME_EMAIL=%s\n' "$ACME_EMAIL" > "$TMP"
+cmp -s "$TMP" /opt/traefik/.env || { install -m 600 -o root -g root "$TMP" /opt/traefik/.env; CHANGED+=(".env"); }
+rm -f "$TMP"
+before=$(docker compose -f "$COMPOSE" ps -q | sort)
+docker compose -f "$COMPOSE" up -d --quiet-pull
+after=$(docker compose -f "$COMPOSE" ps -q | sort)
+[ "$before" = "$after" ] || CHANGED+=("traefik up")
+
+# --- 6. ufw: web ports ---
+for p in 80/tcp 443/tcp; do
+  ufw status | grep -qE "^$p +ALLOW" || { ufw allow "$p" >/dev/null; CHANGED+=("ufw $p"); }
+done
+
+# --- 7. deployer: no sudo, no password, group docker, login only with project keys ---
+# Home, ~/.ssh and authorized_keys are owned by root: the owner of a directory can rename
+# or delete any file in it and replace its own forced command.
+# deploy-app keeps the registry login in /opt/<app>/state/docker, so it never writes to home.
+if ! id deployer >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash deployer
+  passwd -l deployer >/dev/null
+  CHANGED+=("deployer")
+fi
+id -nG deployer | grep -qw docker || { usermod -aG docker deployer; CHANGED+=("deployer→docker"); }
+if ! grep -qE '^AllowUsers\b.*\bdeployer\b' "$HARD"; then
+  grep -q '^AllowUsers ' "$HARD" || die "no AllowUsers in $HARD: rerun vps-init"
+  cp -p "$HARD" "$HARD.bak"
+  sed -i 's/^\(AllowUsers .*\)$/\1 deployer/' "$HARD"
+  # the config is checked before reload: a broken sshd would lock out the admin too
+  sshd -t || { mv "$HARD.bak" "$HARD"; die "sshd -t failed, $HARD restored"; }
+  rm -f "$HARD.bak"
+  systemctl try-reload-or-restart ssh
+  CHANGED+=("AllowUsers deployer")
+fi
+DH=/home/deployer
+for d in "$DH" "$DH/.ssh"; do
+  [ -d "$d" ] || install -d -m 755 -o root -g root "$d"
+  [ "$(stat -c %U:%G:%a "$d")" = root:root:755 ] || { chown root:root "$d"; chmod 755 "$d"; CHANGED+=("$d root 755"); }
+done
+[ -f "$DH/.ssh/authorized_keys" ] || install -m 644 -o root -g root /dev/null "$DH/.ssh/authorized_keys"
+[ "$(stat -c %U:%G:%a "$DH/.ssh/authorized_keys")" = root:root:644 ] \
+  || { chown root:root "$DH/.ssh/authorized_keys"; chmod 644 "$DH/.ssh/authorized_keys"; CHANGED+=("authorized_keys root 644"); }
+
+# --- 7a. /usr/local/bin/deploy-app: forced command of the project keys ---
+TMP=$(mktemp)
+base64 -d <<<"$DEPLOY_APP_B64" > "$TMP"
+if ! cmp -s "$TMP" /usr/local/bin/deploy-app || [ "$(stat -c %U:%G:%a /usr/local/bin/deploy-app)" != root:root:755 ]; then
+  install -m 755 -o root -g root "$TMP" /usr/local/bin/deploy-app
+  CHANGED+=("deploy-app")
+fi
+rm -f "$TMP"
+
+# --- 8. weekly image prune (a safety net: the deploy script prunes too) ---
+UNIT=/etc/systemd/system/docker-image-prune
+cat > "$UNIT.service.new" <<'EOF'
+[Unit]
+Description=Remove Docker images older than a week
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker image prune -af --filter until=168h
+EOF
+cat > "$UNIT.timer.new" <<'EOF'
+[Unit]
+Description=Weekly docker image prune
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
+units=0
+for u in service timer; do
+  if cmp -s "$UNIT.$u.new" "$UNIT.$u"; then rm "$UNIT.$u.new"; else mv "$UNIT.$u.new" "$UNIT.$u"; units=1; fi
+done
+if [ $units = 1 ]; then systemctl daemon-reload; CHANGED+=("prune timer"); fi
+systemctl is-enabled -q docker-image-prune.timer || CHANGED+=("prune timer enabled")
+systemctl enable -q --now docker-image-prune.timer
+
+STATE=$( [ ${#CHANGED[@]} -eq 0 ] && echo "no changes" || echo "changed: ${CHANGED[*]}" )
+echo "✓ Docker $(docker version -f '{{.Server.Version}}'), traefik + socket-proxy in /opt/traefik, network proxy, ufw 80/443, deployer in AllowUsers, deploy-app, weekly prune: $STATE"
+WEB

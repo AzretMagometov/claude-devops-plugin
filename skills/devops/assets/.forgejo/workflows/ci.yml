@@ -1,0 +1,250 @@
+# CI/CD on a self-hosted Forgejo runner.
+#
+#   test    the project gates, on every push and pull request
+#   build   only a green `main`: build → scan → push to the Forgejo registry
+#   deploy  ssh deployer@server "deploy <sha>"; the forced command on the
+#           server does the rest, including auto-rollback
+#
+# Adapt to the project: the `test` job only (image, services, steps).
+#
+# Repository variable (Settings → Actions → Variables; add-project.sh sets it
+# with FORGEJO_API_TOKEN):
+#   REGISTRY         host of the Forgejo instance, e.g. git.example.com: the
+#                    registry of the image and the address of the sources
+#
+# Repository secrets (Settings → Actions → Secrets, or the API):
+#   REGISTRY_TOKEN   Forgejo token, scope write:package — pushes the image
+#   DEPLOY_HOST      server IP
+#   DEPLOY_SSH_KEY   private half of the deployer key with the forced command
+#   DEPLOY_HOST_KEY  server host key: `<IP> ssh-ed25519 AAAA...`
+#
+# Manual run with an existing tag = rollback to that build, no rebuild.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Commit hash of an image already in the registry
+        required: true
+        # Forgejo renders an input without `type` as "Invalid input type", not a field.
+        type: string
+
+env:
+  # Not `github.server_url`: on a runner it can be http://localhost:3000, the
+  # default ROOT_URL of the instance, unreachable from the job container.
+  REGISTRY: ${{ vars.REGISTRY }}
+  IMAGE: ${{ vars.REGISTRY }}/${{ github.repository }}
+  REPO_URL: https://${{ vars.REGISTRY }}/${{ github.repository }}.git
+
+# The job container's /bin/sh is dash, which has no `pipefail`.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The base image of the application image: one runtime, one behaviour.
+    container:
+      image: python:3.12-slim-bookworm
+    # Real PostgreSQL and Redis; they answer by service name.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+      redis:
+        image: redis:8-alpine
+    env:
+      TEST_DATABASE_URL: postgresql://test:test@postgres:5432/test
+      TEST_REDIS_URL: redis://redis:6379/0
+    steps:
+      # Slim images carry no git.
+      - name: Install git
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
+      # Plain git instead of actions/checkout: the runner does not depend on a
+      # third-party action catalogue. The commit is fetched by its hash.
+      - name: Fetch the sources
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n $REGISTRY ]] || { echo "repository variable REGISTRY is not set (Settings → Actions → Variables)"; exit 1; }
+          git init -q .
+          git config --global --add safe.directory "$PWD"
+          git fetch -q --depth 1 "https://x-access-token:${REPO_TOKEN}@${REPO_URL#https://}" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      # The runner starts service containers without waiting for them.
+      - name: Wait for PostgreSQL and Redis
+        run: |
+          python - <<'PY'
+          import socket
+          import time
+
+          for host, port in (("postgres", 5432), ("redis", 6379)):
+              deadline = time.monotonic() + 60
+              while True:
+                  try:
+                      socket.create_connection((host, port), timeout=2).close()
+                      break
+                  except OSError:
+                      if time.monotonic() > deadline:
+                          raise SystemExit(f"{host}:{port} did not answer within 60 s")
+                      time.sleep(1)
+          PY
+
+      # The same gates a developer runs locally.
+      - name: Run the gates
+        run: |
+          set -euo pipefail
+          pip install --no-cache-dir --root-user-action=ignore uv==0.10.4
+          uv sync --frozen
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run mypy
+          uv run pytest -q
+
+  build:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the sources
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n $REGISTRY ]] || { echo "repository variable REGISTRY is not set (Settings → Actions → Variables)"; exit 1; }
+          git init -q .
+          git config --global --add safe.directory "$PWD"
+          git fetch -q --depth 1 "https://x-access-token:${REPO_TOKEN}@${REPO_URL#https://}" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Log in to the registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          # The owner of the repository owns the token; an organization
+          # repository needs the login of the token owner here instead.
+          REGISTRY_USER: ${{ github.repository_owner }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
+
+      # The docker-container driver can export the layer cache to the registry;
+      # the builder survives between runs on this runner.
+      - name: Prepare the builder
+        run: |
+          set -euo pipefail
+          builder="${GITHUB_REPOSITORY#*/}"
+          docker buildx inspect "$builder" >/dev/null 2>&1 \
+            || docker buildx create --name "$builder" --driver docker-container
+          docker buildx use "$builder"
+
+      # linux/amd64 is explicit: the server is amd64, development is arm64.
+      # The cache is an OCI image manifest: the Forgejo registry stores images only.
+      # `--load`, not `--push`: the image is scanned before it is published.
+      - name: Build the image
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --cache-from "type=registry,ref=${IMAGE}:cache" \
+            --cache-to "type=registry,ref=${IMAGE}:cache,mode=max,image-manifest=true,oci-mediatypes=true" \
+            --tag "${IMAGE}:${GITHUB_SHA}" \
+            --load \
+            .
+
+      # HIGH and CRITICAL go to the log and never fail the run.
+      - name: Report HIGH and CRITICAL vulnerabilities
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v trivy-cache:/root/.cache/trivy \
+            aquasec/trivy:0.74.0 image \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 \
+            "${IMAGE}:${GITHUB_SHA}"
+
+      # A CRITICAL with a fix available stops the release.
+      - name: Fail on a fixable CRITICAL vulnerability
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v trivy-cache:/root/.cache/trivy \
+            aquasec/trivy:0.74.0 image \
+            --ignore-unfixed \
+            --severity CRITICAL \
+            --exit-code 1 \
+            "${IMAGE}:${GITHUB_SHA}"
+
+      - name: Publish the image
+        run: docker push "${IMAGE}:${GITHUB_SHA}"
+
+      # The runner disk is small; the registry holds the image now.
+      - name: Drop the local copy of the image
+        if: success()
+        run: docker image rm "${IMAGE}:${GITHUB_SHA}"
+
+      - name: Log out of the registry
+        if: always()
+        run: docker logout "$REGISTRY"
+
+  deploy:
+    needs: build
+    # After a green build on `main`, or on a manual run where build is skipped.
+    # Without `!cancelled()` the skipped build would skip deploy too.
+    if: >-
+      !cancelled()
+      && (needs.build.result == 'success' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    # Two pushes in a row deploy one after the other; a running deploy is not cut.
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+    steps:
+      - name: Deploy the tag
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+          # Passed through the environment, never pasted into the command text.
+          TAG: ${{ inputs.image_tag || github.sha }}
+        run: |
+          set -euo pipefail
+          [[ $TAG =~ ^[0-9a-f]{40}$ ]] || { echo "tag ${TAG} is not a commit hash"; exit 1; }
+          command -v ssh > /dev/null || { apt-get update -qq && apt-get install -y -qq openssh-client; }
+
+          # Own directory, not ~/.ssh: the runner home holds a foreign
+          # id_ed25519.pub, and ssh would offer that public half instead.
+          SSH_DIR="${RUNNER_TEMP:-/tmp}/deploy-ssh"
+          rm -rf "$SSH_DIR"
+          mkdir -p "$SSH_DIR"
+          chmod 700 "$SSH_DIR"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$SSH_DIR/key"
+          chmod 600 "$SSH_DIR/key"
+          # A damaged secret otherwise shows up as "Permission denied (publickey)".
+          ssh-keygen -lf "$SSH_DIR/key" \
+            || { echo "secret DEPLOY_SSH_KEY is not a private key"; exit 1; }
+          # The host key is pinned by a secret, not trusted on first connect.
+          printf '%s\n' "$DEPLOY_HOST_KEY" > "$SSH_DIR/known_hosts"
+          chmod 600 "$SSH_DIR/known_hosts"
+
+          # The deployer key is bound to a forced command: "deploy <tag>" is
+          # its argument, not a shell command.
+          ssh -F /dev/null \
+              -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+              -i "$SSH_DIR/key" "deployer@${DEPLOY_HOST}" "deploy ${TAG}"
+
+      - name: Wipe the key
+        if: always()
+        run: rm -rf "${RUNNER_TEMP:-/tmp}/deploy-ssh"

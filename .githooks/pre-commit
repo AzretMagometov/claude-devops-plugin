@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Pre-commit guard against leaks into this public repository.
+# 1. Staged content against a private marker list kept outside the repository:
+#    $DEVOPS_PRIVATE_MARKERS, default ~/.config/devops/private-markers, one
+#    extended regex per line, case-insensitive; lines starting with # and
+#    empty lines are ignored. Only file:line of a hit is printed, never the
+#    matched text. A missing list prints a notice and skips this step.
+# 2. gitleaks over the staged changes.
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+
+MARKERS=${DEVOPS_PRIVATE_MARKERS:-$HOME/.config/devops/private-markers}
+
+if [ -f "$MARKERS" ]; then
+  PATTERNS=$(mktemp)
+  trap 'rm -f "$PATTERNS"' EXIT
+  grep -v -e '^#' -e '^[[:space:]]*$' "$MARKERS" > "$PATTERNS" || true
+  N=$(wc -l < "$PATTERNS" | tr -d ' ')
+  if [ "$N" -gt 0 ]; then
+    HITS=$(git grep --cached -I -n -i -E -f "$PATTERNS" -- . | cut -d: -f1,2 || true)
+    if [ -n "$HITS" ]; then
+      echo "pre-commit: staged content matches the private marker list $MARKERS:" >&2
+      while IFS= read -r h; do echo "  $h: matches a private marker" >&2; done <<<"$HITS"
+      exit 1
+    fi
+  fi
+  echo "pre-commit: markers: $N patterns, no hits"
+else
+  echo "pre-commit: marker list $MARKERS is missing, only gitleaks runs" >&2
+fi
+
+command -v gitleaks >/dev/null || { echo "pre-commit: gitleaks is not installed (https://github.com/gitleaks/gitleaks)" >&2; exit 1; }
+gitleaks git --pre-commit --staged --redact --no-banner . || { echo "pre-commit: gitleaks found a secret in the staged changes" >&2; exit 1; }
