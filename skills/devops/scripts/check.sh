@@ -9,7 +9,8 @@
 # A missing anchor means the layer is not installed yet: that is state, not an
 # error. A present anchor with a failed assertion means the layer is broken.
 # The vps layer also compares auto-reboot with VPN detection; a mismatch is a
-# WARN line, not counted in FAIL.
+# WARN line, not counted in FAIL. On LAYER=web a project whose /opt/<app>/.env
+# has no IMAGE line is a WARN too: deploy-app cannot roll it out.
 # Two findings are errors on any layer: a container other than Traefik that
 # publishes a port on all interfaces, and a container other than socket-proxy
 # that mounts the Docker socket.
@@ -94,6 +95,11 @@ if systemctl is-active -q docker 2>/dev/null; then
       sock=$(docker inspect -f '{{range .Mounts}}{{.Source}} {{end}}' "${line%%|*}" | tr ' ' '\n' | grep -m1 'docker\.sock$')
       f container "${line#*|}|$sock"
     done
+  # Only whether IMAGE is set: the rest of .env stays on the server.
+  docker ps --format '{{.Label "com.docker.compose.project"}}' | sort -u | while read -r p; do
+    case $p in ''|traefik|*[!a-z0-9_-]*) continue ;; esac
+    if [ -f "/opt/$p/.env" ]; then f env_image "$p|$(yn grep -qE '^IMAGE=.+' "/opt/$p/.env")"; else f env_image "$p|"; fi
+  done
 fi
 
 f deployer_exists "$(yn id deployer)"
@@ -168,6 +174,9 @@ deployer_keys_root() { is deployer_keys_owner "root:755 root:755 root:644"; }
 prune_ok() { is prune_enabled 1 && is prune_active 1; }
 
 echo "== $HOST"
+layer=none
+is hard_conf 1 && layer=vps
+[ $layer = vps ] && is web_anchor 1 && layer=web
 
 echo "-- vps (vps-init)"
 if is hard_conf 1; then
@@ -206,6 +215,10 @@ if is web_anchor 1; then
   check "deployer: home, .ssh, authorized_keys root 755/755/644" deployer_keys_root
   check "/usr/local/bin/deploy-app root 755" is deploy_app root:755
   check "timer docker-image-prune" prune_ok
+  # Legacy projects predate IMAGE in .env; the new deploy-app stops without it.
+  [ $layer != web ] || facts env_image | while IFS='|' read -r app set; do
+    [ "$set" != 0 ] || warn "$app: no IMAGE in /opt/$app/.env, deploy-app cannot roll out without it: add IMAGE=$(devops_image "$app")"
+  done
 else
   note "not installed: no /opt/traefik/compose.yml"
 fi
@@ -227,9 +240,6 @@ if [ -n "$disk" ]; then
   if [ "$disk" -lt 85 ]; then note "disk /: ${disk}%"; else note "disk /: ${disk}%, clean up before a rollout"; fi
 fi
 
-layer=none
-is hard_conf 1 && layer=vps
-[ $layer = vps ] && is web_anchor 1 && layer=web
 projects=$(awk -F'|' '$2!="" && $2!="traefik" {print $2}' <<<"$containers" | sort -u | paste -sd, -)
 echo "LAYER=$layer FAIL=$FAILS PROJECTS=$projects"
 [ "$FAILS" -eq 0 ]

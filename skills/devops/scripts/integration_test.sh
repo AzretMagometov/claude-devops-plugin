@@ -250,6 +250,13 @@ printf '%s\n' "$OUT" | grep -E 'FAIL|LAYER' || true
 check "check.sh: web layer, FAIL=0, demo listed" grep -qE "^LAYER=web FAIL=0 PROJECTS=.*$APP" <<<"$OUT"
 check "check.sh: no WARN with auto-reboot on" no_warn "$OUT"
 
+say "legacy project: no IMAGE in .env"
+admin "sudo cp -p /opt/$APP/.env /opt/$APP/.env.bak && sudo sed -i '/^IMAGE=/d' /opt/$APP/.env"
+rc=0; OUT=$(bash "$SKILL/scripts/check.sh" "$HOST") || rc=$?
+check "check.sh: WARN names the app without IMAGE" grep -q "^  WARN  $APP: no IMAGE in /opt/$APP/.env, deploy-app cannot roll out without it: add IMAGE=" <<<"$OUT"
+check "check.sh: the IMAGE WARN keeps FAIL=0 and rc 0" test "$(tail -n1 <<<"$OUT" | cut -d' ' -f1,2) $rc" = "LAYER=web FAIL=0 0"
+admin "sudo mv /opt/$APP/.env.bak /opt/$APP/.env"
+
 say "VPN node: unit xray.service → no auto-reboot"
 admin "printf '[Service]\nExecStart=/bin/true\n' | sudo tee /etc/systemd/system/xray.service >/dev/null && sudo systemctl daemon-reload"
 rc=0; OUT=$(bash "$SKILL/scripts/check.sh" "$HOST") || rc=$?

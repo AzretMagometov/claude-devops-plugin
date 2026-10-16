@@ -41,6 +41,7 @@ prune_enabled=1
 prune_active=1
 vpn_signal=
 auto_reboot=1
+env_image=myapp|1
 disk_used=41'
 
 # Facts of a VPN server: vps-init done, xray on 443 as a host process, no Docker.
@@ -128,6 +129,29 @@ case_ "no auto-reboot off VPN"     "${WEB_OK/auto_reboot=1/auto_reboot=0}" '^LAY
 case_ "auto-reboot on VPN"         "${VPS_OK/auto_reboot=0/auto_reboot=1}" '^LAYER=vps FAIL=0 PROJECTS=$' 0 1
 case_ "legacy facts: no auto-reboot keys" "$(grep -vE '^(vpn_signal|auto_reboot)=' <<<"$WEB_OK")" '^LAYER=web FAIL=0 ' 0 1
 case_ "fresh server: no auto-reboot WARN" "$FRESH" '^LAYER=none FAIL=0 ' 0 0
+case_ "web project without IMAGE" "${WEB_OK/env_image=myapp|1/env_image=myapp|0}" '^LAYER=web FAIL=0 PROJECTS=myapp$' 0 1
+case_ "web project without .env"  "${WEB_OK/env_image=myapp|1/env_image=myapp|}" '^LAYER=web FAIL=0 ' 0 0
+case_ "vps layer: no IMAGE check" "$VPS_OK
+env_image=myapp|0" '^LAYER=vps FAIL=0 ' 0 0
+
+# The IMAGE WARN names the app and gives the line to add: from the config
+# when the registry is known, else the generic form.
+image_warn() {  # image_warn <name> <expected IMAGE value> <env assignments...>
+  local name=$1 want=$2 out line
+  shift 2
+  printf '%s\n' "${WEB_OK/env_image=myapp|1/env_image=myapp|0}" > "$TMP/facts"
+  out=$(env DEVOPS_CONFIG=/dev/null DEVOPS_ADMIN=ops CHECK_FACTS_FILE="$TMP/facts" "$@" bash "$CHECK" test-host || true)
+  line=$(grep '^  WARN  ' <<<"$out" || true)
+  if [[ $line == "  WARN  myapp: no IMAGE in /opt/myapp/.env, deploy-app cannot roll out without it: add IMAGE=$want" ]]; then
+    echo "ok   $name"
+  else
+    echo "FAIL $name: got «${line}»"
+    FAILED=$((FAILED + 1))
+  fi
+}
+image_warn "IMAGE hint: generic form"  "<registry>/<owner>/myapp"
+image_warn "IMAGE hint: Forgejo"       "registry.example/acme/myapp" DEVOPS_REGISTRY=registry.example DEVOPS_REGISTRY_USER=acme
+image_warn "IMAGE hint: GitHub"        "ghcr.io/acme/myapp" DEVOPS_FORGE=github DEVOPS_REGISTRY_USER=Acme
 
 # vps-init and check.sh carry the same vpn_signal(): the remote heredocs
 # cannot source a shared file, so the copies must stay identical.

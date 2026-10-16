@@ -39,16 +39,14 @@ ADMIN=$DEVOPS_ADMIN
 [[ $# -eq 2 ]] || die "usage: $(basename "$0") <host> <app>"
 HOST=$1 APP=$2
 [[ $APP =~ ^[a-z0-9][a-z0-9_-]{0,40}$ ]] || die "project name \"${APP}\" does not match ^[a-z0-9][a-z0-9_-]{0,40}$"
+IMAGE=$(devops_image "$APP")
 if [[ $DEVOPS_FORGE == github ]]; then
   REPO=${GITHUB_REPO:-$DEVOPS_REGISTRY_USER/$APP}
-  # GHCR takes lower-case image names only.
-  IMAGE=ghcr.io/$(tr '[:upper:]' '[:lower:]' <<<"$DEVOPS_REGISTRY_USER")/$APP
   PULL_TOKEN="a GitHub personal access token (classic) with scope read:packages"
   ENV_HINT="IMAGE=${IMAGE}, REGISTRY_USER is your GitHub login, REGISTRY_TOKEN is ${PULL_TOKEN}"
 else
   FORGEJO_URL=${FORGEJO_URL:-https://$DEVOPS_REGISTRY}
   REPO=${FORGEJO_REPO:-$DEVOPS_REGISTRY_USER/$APP}
-  IMAGE=$DEVOPS_REGISTRY/$DEVOPS_REGISTRY_USER/$APP
   PULL_TOKEN="a Forgejo token with scope read:package"
   ENV_HINT="REGISTRY_TOKEN is a read:package token"
 fi
