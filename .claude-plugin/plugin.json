@@ -5,6 +5,8 @@
   "author": {
     "name": "Azret Magometov"
   },
+  "homepage": "https://github.com/AzretMagometov/claude-devops-plugin",
+  "repository": "https://github.com/AzretMagometov/claude-devops-plugin",
   "license": "MIT",
   "keywords": ["devops", "vps", "deploy", "docker", "traefik", "forgejo", "github-actions", "vpn", "xray"]
 }
