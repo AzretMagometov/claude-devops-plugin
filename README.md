@@ -173,6 +173,10 @@ bash skills/devops/scripts/integration_vpn_test.sh  # vpn-deploy on a fresh cont
 The integration tests start a privileged Ubuntu container with systemd. They
 never touch `~/.ssh/config`. Run them one after another, not in parallel.
 
+GitHub Actions (`.github/workflows/test.yml`) runs shellcheck on every shell
+script, validates `.claude-plugin/*.json` and runs all tests except the
+integration tests on each push to `main` and each pull request.
+
 ## Security notes
 
 The scripts change the server as root through sudo. Read them before you run
