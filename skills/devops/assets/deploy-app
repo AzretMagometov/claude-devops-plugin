@@ -16,6 +16,9 @@
 #   /opt/<app>/state          deployer 755        the only place deployer writes:
 #                             last-known-good, deploy.log, deploy.lock,
 #                             pre-deploy.sql.gz, docker/ (registry login)
+#   /opt/<app>/compose-policy-allow
+#                             root:root 644       optional, exceptions to the
+#                             compose policy (below), written by hand
 #   /home/deployer, .ssh      root:root 755       deployer cannot swap its keys
 #   .ssh/authorized_keys      root:root 644
 #
@@ -29,10 +32,77 @@
 # means code and stack layout at once and a rollback brings the old stack back.
 # /opt/<app>/docker-compose.yml is the fallback for images without it.
 # Compose gets IMAGE and IMAGE_TAG in the environment, which wins over .env.
+#
+# Compose policy. deployer is in the docker group and the compose file comes
+# from whoever can push to main, so the file decides what runs as root on a
+# server shared with other projects. Before any change to production, and
+# again before a rollback, the stack of the tag is rendered with
+# `docker compose config --format json` and checked with jq. A finding is a
+# token, <service>.<key> or <top-level section>.<name>.<key>:
+#   <svc>.privileged                     privileged: true
+#   <svc>.network_mode|pid|ipc|uts|cgroup|userns_mode
+#                                        host, or container:<other>
+#   <svc>.cap_add|devices|device_cgroup_rules
+#                                        not empty
+#   <svc>.security_opt                   an *unconfined* apparmor or seccomp
+#   <svc>.volumes_from:container:<name>  volumes of a container outside the stack
+#   <svc>.volumes:<source>               a bind mount not strictly below
+#                                        /opt/<app>/ (the docker socket too),
+#                                        or of compose-policy-allow itself:
+#                                        container root writes as host root
+#   volumes.<name>.external|driver|driver_opts|name
+#                                        external, a driver other than local,
+#                                        driver_opts (a bind in disguise), or
+#                                        a name without the <app>_ prefix
+#   networks.<name>.external|name        external other than proxy, or a name
+#                                        without the <app>_ prefix
+#   secrets|configs.<name>.file          a file outside /opt/<app>/
+# Named volumes, tmpfs and binds below /opt/<app>/ pass. Any finding stops
+# the run. Root grants an exception in /opt/<app>/compose-policy-allow: one
+# token per line, exactly as the refusal prints it; `#` starts a comment.
+#   # the vpn sidecar manages routes
+#   vpn.cap_add
+#   app.volumes:/srv/shared
+# The file must be a regular file of root, writable by root alone; otherwise
+# the run stops: deployer must not grant itself exceptions.
 set -euo pipefail
 
 HEALTH_TIMEOUT=180
 COMPOSE_IN_IMAGE=/app/docker-compose.yml
+
+# The compose policy (header) over the JSON of `docker compose config`, which
+# gives volumes in long syntax with sources resolved against /opt/<app> and
+# top-level names already prefixed with the project. Prints one token per
+# finding.
+# shellcheck disable=SC2016 # jq variables
+POLICY='
+  def ns_escape: type == "string" and (. == "host" or startswith("container:"));
+  def outside: (startswith($dir + "/") | not) or . == $allow;
+  def foreign: startswith($app + "_") | not;
+  (.services // {} | to_entries[] | .key as $svc | .value | (
+      (select(.privileged == true) | "privileged"),
+      (("network_mode", "pid", "ipc", "uts", "cgroup", "userns_mode") as $k
+        | select(.[$k] | ns_escape) | $k),
+      (("cap_add", "devices", "device_cgroup_rules") as $k
+        | select(.[$k] // [] | length > 0) | $k),
+      (select(any(.security_opt[]?; test("unconfined"))) | "security_opt"),
+      (.volumes_from[]? | select(startswith("container:")) | "volumes_from:" + .),
+      (.volumes[]? | select(.type == "bind") | .source | select(outside) | "volumes:" + .)
+    ) | "\($svc).\(.)"),
+  (.volumes // {} | to_entries[] | .key as $v | .value | (
+      (select(.external == true) | "external"),
+      (select(.driver != null and .driver != "local") | "driver"),
+      (select(.driver_opts != null) | "driver_opts"),
+      (select(.external != true and (.name // ($app + "_") | foreign)) | "name")
+    ) | "volumes.\($v).\(.)"),
+  (.networks // {} | to_entries[] | .key as $n | .value | (
+      (select(.external == true and .name != "proxy") | "external"),
+      (select(.external != true and (.name // ($app + "_") | foreign)) | "name")
+    ) | "networks.\($n).\(.)"),
+  (("secrets", "configs") as $sec | .[$sec] // {} | to_entries[]
+    | select(.value.file != null and (.value.file | outside))
+    | "\($sec).\(.key).file")
+'
 
 log() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -63,6 +133,23 @@ TAG=${BASH_REMATCH[1]}
 # stale tag.
 exec 9> "$STATE_DIR/deploy.lock"
 flock -n 9 || die "another rollout of ${APP} is running, retry later"
+
+command -v jq > /dev/null || die "jq is not installed, the compose policy cannot run (web-init installs it)"
+
+# --- compose policy exceptions ---------------------------------------------
+ALLOW_FILE=$PROJECT_DIR/compose-policy-allow
+if [[ -e $ALLOW_FILE || -L $ALLOW_FILE ]]; then
+  read -r allow_uid allow_mode < <(stat -c '%u %a' "$ALLOW_FILE")
+  if [[ -L $ALLOW_FILE || ! -f $ALLOW_FILE || $allow_uid != 0 ]] || (( 8#$allow_mode & 8#022 )); then
+    die "${ALLOW_FILE} must be a regular file of root, writable by root alone (chown root:root, chmod 644); production untouched"
+  fi
+fi
+# The granted tokens: comments, blanks around them and empty lines dropped
+# (an empty pattern would match every finding).
+allowed_tokens() {
+  [[ -e $ALLOW_FILE ]] || return 0
+  sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$ALLOW_FILE" | grep -v '^$' || true
+}
 
 # --- .env -----------------------------------------------------------------
 [[ -r .env ]] || die "cannot read ${PROJECT_DIR}/.env"
@@ -113,6 +200,21 @@ compose() {
     --env-file "$PROJECT_DIR/.env" \
     -f - "${@:2}"
 }
+
+# policy_findings <tag>: the findings of the stack of that tag not granted by
+# the allow file, comma-separated; fails when compose cannot render it.
+policy_findings() {
+  local json
+  json=$(compose "$1" config --format json) && [[ -n $json ]] || return 1
+  jq -r --arg app "$APP" --arg dir "$PROJECT_DIR" --arg allow "$ALLOW_FILE" "$POLICY" <<< "$json" \
+    | { grep -Fxv -f <(allowed_tokens) || true; } | paste -sd, - | sed 's/,/, /g'
+}
+
+# Before the stack images are pulled, the dump and up: a refused stack
+# changes nothing.
+FINDINGS=$(policy_findings "$TAG") || die "compose of ${TAG} does not render; production untouched"
+[[ -z $FINDINGS ]] \
+  || die "compose of ${TAG} refused by the server policy: ${FINDINGS}; root may grant exceptions in ${ALLOW_FILE}; production untouched"
 
 compose "$TAG" pull --quiet || die "stack images for ${TAG} did not download; production untouched"
 
@@ -170,6 +272,15 @@ compose "$TAG" logs --tail 40 --no-color >&2 || true
 
 [[ -n $PREVIOUS ]] \
   || die "no previous tag, nothing to roll back to: needs a human"
+# last-known-good sits in the deployer-writable state/, and the previous
+# stack is checked as strictly as a new one: an exception revoked since its
+# rollout keeps it down.
+[[ $PREVIOUS =~ ^[0-9a-f]{40}$ ]] \
+  || die "last-known-good holds \"${PREVIOUS}\", not a tag: not rolling back, needs a human"
+FINDINGS=$(policy_findings "$PREVIOUS") \
+  || die "compose of the previous tag ${PREVIOUS} does not render: not rolling back, needs a human"
+[[ -z $FINDINGS ]] \
+  || die "previous tag ${PREVIOUS} refused by the server policy: ${FINDINGS}; not rolling back, needs a human"
 
 if compose "$PREVIOUS" up -d --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
   die "rollout of ${TAG} failed, ${APP} rolled back to ${PREVIOUS}"

@@ -58,3 +58,31 @@ adapting:
   Check on the server: `docker exec <app>-app-1 id -u` must not print `0`.
 - No Docker socket in any project container. A tool that needs the Docker API
   goes through socket-proxy with the minimum of allowed sections.
+
+## The compose policy of deploy-app
+
+`deployer` is in the `docker` group, and the compose file comes from the
+image, so whoever can push to main decides what runs as root on a server
+shared with other projects. `deploy-app` renders the stack of the tag with
+`docker compose config --format json` before the dump and `up`, and again
+before a rollback, and refuses it with `privileged`, a host or
+`container:` namespace (`network_mode`, `pid`, `ipc`, `uts`, `cgroup`,
+`userns_mode`), `cap_add`, `devices`, `device_cgroup_rules`, an
+`unconfined` `security_opt`, `volumes_from` another container, a bind mount
+outside `/opt/<app>/` (the Docker socket included), a named volume or
+network that is external, carries `driver_opts` or another project's name
+(the shared `proxy` network excepted), and `secrets`/`configs` files outside
+`/opt/<app>/`. The refusal names each finding, such as `app.cap_add`; the
+production stack stays as it was. A previous tag that fails the policy is not
+rolled back to.
+
+An exception is a line in `/opt/<app>/compose-policy-allow` with the finding
+exactly as the refusal prints it; `#` starts a comment. Only root writes the
+file: `deploy-app` stops when it is not a regular file of root or is writable
+by group or others.
+
+```bash
+echo 'socket-proxy.volumes:/var/run/docker.sock  # read-only API for the tool' \
+  | sudo tee -a /opt/<app>/compose-policy-allow
+sudo chmod 644 /opt/<app>/compose-policy-allow
+```

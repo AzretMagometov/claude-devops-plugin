@@ -164,7 +164,7 @@ Run the tests from the repository root. They never read
 bash skills/devops/scripts/config_test.sh        # config loading, missing keys
 bash skills/devops/scripts/check_test.sh         # layer logic of check.sh
 bash skills/devops/scripts/add-project_test.sh   # both forges, with shims, no server
-bash skills/devops/scripts/deploy-app_test.sh    # deploy-app in a Debian container
+bash skills/devops/scripts/deploy-app_test.sh    # deploy-app in a Debian container, installs jq there
 bash skills/devops/scripts/migrate_test.sh       # Alembic migrate command in a Python container
 bash skills/devops/scripts/integration_test.sh   # vps-init, web-init, add-project.sh, real rollouts, ~10 min
 bash skills/devops/scripts/integration_vpn_test.sh  # vpn-deploy on a fresh container, ~3 min
@@ -191,6 +191,26 @@ them against a server that already holds data.
   `deploy-app <app>`. Its `~/.ssh` belongs to root, so a leaked key cannot
   replace its own forced command.
 - `deploy-app` accepts only `deploy <40-hex sha>` and refuses other input.
+- `deploy-app` checks the compose file of the tag before it changes
+  production and before a rollback. It refuses privileged containers, host
+  namespaces, added capabilities and devices, unconfined seccomp or
+  AppArmor, the Docker socket, bind mounts outside `/opt/<app>/`, and
+  volumes or networks of other projects. Root grants exceptions in
+  `/opt/<app>/compose-policy-allow`
+  ([security-checklist.md](skills/devops/references/security-checklist.md)).
+
+### Trust model
+
+Several projects, possibly of different clients, share one web server. A
+push to the main branch of a project can change only that project: the
+compose policy of `deploy-app` stops a pushed compose file from reaching the
+host or another project through the keys above. The policy does not limit
+the application code. That code runs with its own secrets and its own
+database, and it reaches whatever its network allows. The policy also does
+not cover a kernel or Docker escape. It checks bind sources as paths and
+does not follow symlinks, so a container that writes to a bind below
+`/opt/<app>/` can plant a symlink there for a later rollout. Keep projects with different trust levels on separate VPS
+when you need strong isolation.
 - `add-project.sh` deletes the local copy of the private deploy key after it
   uploads the key as a repository secret.
 - `vpn-deploy` writes client links to `~/vpn-configs/<IP>` on your machine

@@ -138,6 +138,14 @@ What `deploy-app <app>` does on `ssh deployer@<host> "deploy <sha>"`:
 - takes the compose file from the image (`/app/docker-compose.yml`,
   fallback `/opt/<app>/docker-compose.yml`), passes `IMAGE` and `IMAGE_TAG`
   in the environment, project name `<app>`;
+- renders that compose with `docker compose config --format json` and checks
+  it with `jq` before the dump and `up`: privileged, host or `container:`
+  namespaces, `cap_add`, `devices`, unconfined `security_opt`, binds outside
+  `/opt/<app>/` (the Docker socket included), foreign or external volumes and
+  networks (except `proxy`), `secrets`/`configs` files outside `/opt/<app>/`
+  stop the rollout with the findings named; exceptions are lines in the
+  root-owned `/opt/<app>/compose-policy-allow`
+  (references/security-checklist.md);
 - if the running stack has a `postgres` service: `pg_dump` of every
   non-template database of its cluster, each after a `\connect`, into
   `state/pre-deploy.sql.gz`, one file overwritten by each rollout; a failed
@@ -145,10 +153,12 @@ What `deploy-app <app>` does on `ssh deployer@<host> "deploy <sha>"`:
   line;
 - `up -d --remove-orphans --wait`; healthy → the tag goes to
   `state/last-known-good`, `docker image prune`; not healthy → logs and
-  rollback to `last-known-good`;
+  rollback to `last-known-good`, which passes the same policy first or the
+  run stops with "needs a human";
 - copies its output to `state/deploy.log`.
 
-Tests: `scripts/deploy-app_test.sh` (parsing, lock, pre-deploy dump; runs
+Tests: `scripts/deploy-app_test.sh` (parsing, lock, pre-deploy dump,
+compose policy; runs
 in a debian container on macOS), `scripts/migrate_test.sh` (the Alembic
 migrate command against SQLite, in a python container),
 `scripts/config_test.sh` (`~/.config/devops/env` loading and missing keys),
