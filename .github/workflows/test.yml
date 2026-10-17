@@ -1,0 +1,59 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: shellcheck
+        # Every tracked shell script: a sh/bash shebang or a `# shellcheck shell=`
+        # directive in the first two lines. Symlinks (bin/*) point at files
+        # already in the list.
+        run: |
+          shellcheck --version
+          git ls-files -z | while IFS= read -r -d '' f; do
+            [[ -L $f ]] && continue
+            if head -n 2 "$f" | grep -qE '^#!.*\b(ba)?sh\b|^# shellcheck shell='; then printf '%s\0' "$f"; fi
+          done > "$RUNNER_TEMP/scripts"
+          tr '\0' '\n' < "$RUNNER_TEMP/scripts"
+          xargs -0 shellcheck -x < "$RUNNER_TEMP/scripts"
+      - name: plugin JSON
+        run: for f in .claude-plugin/*.json; do jq empty "$f" && echo "ok   $f"; done
+
+  unit:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: install gitleaks
+        # .githooks/pre-commit_test.sh runs the hook, and the hook runs gitleaks.
+        run: |
+          tgz=gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$tgz" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$tgz"
+          echo "$GITLEAKS_SHA256  $RUNNER_TEMP/$tgz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP/bin" gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: unit tests
+        # integration_* tests need a privileged systemd container and minutes
+        # of setup: they run by hand. deploy-app_test.sh and migrate_test.sh
+        # start their own Docker containers.
+        run: |
+          failed=()
+          for t in skills/devops/scripts/*_test.sh .githooks/pre-commit_test.sh; do
+            [[ $(basename "$t") == integration_* ]] && continue
+            echo "::group::$t"
+            bash "$t" || failed+=("$t")
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} )); then printf 'FAIL %s\n' "${failed[@]}"; exit 1; fi
