@@ -200,7 +200,8 @@ them against a server that already holds data.
   namespaces, added capabilities and devices, unconfined seccomp or
   AppArmor, the Docker socket, bind mounts other than a direct child of
   `/opt/<app>/` that is not a symlink, `env_file` by the same rule, the
-  Docker API socket option, and volumes or networks of other projects.
+  Docker API socket option, published `ports` (Docker opens them past ufw),
+  and volumes or networks of other projects.
   Root grants exceptions in `/opt/<app>/compose-policy-allow`
   ([security-checklist.md](skills/devops/references/security-checklist.md)).
 - `deploy-app` refuses `include`, `extends` from a file, `label_file` and
@@ -225,7 +226,9 @@ Several projects, possibly of different clients, share one web server. A
 push to the main branch of a project can change only that project: the
 compose policy of `deploy-app` stops a pushed compose file from reaching the
 host or another project through the keys above, through files of other
-projects or through Traefik routes to their hosts. The policy does not limit
+projects or through Traefik routes to their hosts, and from publishing a
+port on the host: Docker writes its own iptables rules, so ufw does not stop
+a published postgres from reaching the internet. The policy does not limit
 the application code. That code runs with its own secrets and its own
 database, and it reaches whatever its network allows. The policy also does
 not cover a kernel or Docker escape. Keep projects with different trust

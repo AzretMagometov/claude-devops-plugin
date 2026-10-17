@@ -281,6 +281,24 @@ config "$SHA" "$CLEAN_APP" '{"configs": {"c": {"name": "demo_c", "file": "/root/
 gate_refuses "config file outside /opt/demo" 'configs\.c\.file'
 refused_app '{"privileged": true, "cap_add": ["NET_ADMIN"]}'
 gate_refuses "every violation listed" 'app\.privileged, app\.cap_add'
+# Docker publishes ports past ufw: postgres on *:5432 is on the internet.
+# One token per port as compose renders it (ranges come one port each):
+# host IP (* = every interface, IPv6 in brackets), published port (* = a
+# random one), target/protocol.
+port_app() { refused_app "{\"ports\": [$1]}"; }
+port_app '{"mode": "ingress", "target": 5432, "published": "5432", "protocol": "tcp"}'
+gate_refuses "published port" 'app\.ports:\*:5432:5432/tcp'
+port_app '{"mode": "ingress", "host_ip": "127.0.0.1", "target": 80, "published": "8080", "protocol": "tcp"}'
+gate_refuses "port on loopback" 'app\.ports:127\.0\.0\.1:8080:80/tcp'
+port_app '{"mode": "ingress", "target": 3000, "protocol": "tcp"}'
+gate_refuses "port without a published number" 'app\.ports:\*:\*:3000/tcp'
+port_app '{"mode": "host", "host_ip": "::1", "target": 53, "published": "53", "protocol": "udp"}'
+gate_refuses "udp port on IPv6" 'app\.ports:\[::1\]:53:53/udp'
+port_app '{"target": 8000, "published": "8000", "protocol": "tcp"}, {"target": 8001, "published": "8001", "protocol": "tcp"}'
+gate_refuses "every port listed" 'app\.ports:\*:8000:8000/tcp, app\.ports:\*:8001:8001/tcp'
+# expose publishes nothing.
+config "$SHA" "$(jq -c '. + {"expose": ["9000"], "ports": []}' <<<"$CLEAN_APP")"
+case_ "expose and empty ports pass" 1 'no previous tag' demo
 
 # A bind is a direct child of /opt/demo: nothing deeper, no `..`. Below a
 # direct child a container of the stack writes as host root and can plant a
@@ -494,6 +512,13 @@ case_ "allow file grants exceptions" 1 'no previous tag' demo
 check "allowed compose reaches up" grep -q ' up ' "$DOCKER_CALLS"
 printf '%s\n' 'app.privileged' > "$ALLOW"
 case_ "allow file grants only what it lists" 1 'refused by the server policy: app\.volumes:/srv/shared;' demo
+# A port exception covers that port alone.
+refused_app '{"ports": [{"host_ip": "127.0.0.1", "target": 80, "published": "8080", "protocol": "tcp"},
+  {"host_ip": "127.0.0.1", "target": 81, "published": "8081", "protocol": "tcp"}]}'
+printf '%s\n' 'app.ports:127.0.0.1:8080:80/tcp  # local admin' > "$ALLOW"
+case_ "port exception covers one port" 1 'refused by the server policy: app\.ports:127\.0\.0\.1:8081:81/tcp;' demo
+printf '%s\n' 'app.ports:127.0.0.1:8080:80/tcp' 'app.ports:127.0.0.1:8081:81/tcp' > "$ALLOW"
+case_ "port exceptions for every port: allowed" 1 'no previous tag' demo
 chmod 664 "$ALLOW"
 case_ "group-writable allow file stops the run" 1 'compose-policy-allow .*root' demo
 check "group-writable allow file: no up" test -z "$(grep ' up ' "$DOCKER_CALLS")"

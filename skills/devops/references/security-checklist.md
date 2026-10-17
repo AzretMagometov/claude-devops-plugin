@@ -89,7 +89,14 @@ symlink on disk, a named volume or network that is external, carries
 `driver_opts` or another project's name (the shared `proxy` network
 excepted), `secrets`/`configs` files and `env_file` paths by the same rule
 as binds, `use_api_socket`, `provider` (a program compose runs on the host),
-`build` and a service without `image`. The refusal names each finding, such
+`build`, a service without `image`, and any published port in `ports`.
+Docker writes its own iptables rules for a published port, so ufw does not
+stop `5432:5432` from reaching the internet; Traefik is the only way in.
+A port finding is `<svc>.ports:<ip>:<published>:<target>/<protocol>`, one
+per port (compose renders a range port by port), `*` for every interface or
+a random host port, IPv6 in brackets: `postgres.ports:*:5432:5432/tcp`,
+`app.ports:127.0.0.1:8080:80/tcp`. An exception covers that one port.
+`expose` publishes nothing and passes. The refusal names each finding, such
 as `app.cap_add`; the production stack stays as it was. A previous tag that
 fails the policy is not rolled back to.
 
@@ -152,6 +159,8 @@ back for that path.
 
 ```bash
 echo 'socket-proxy.volumes:/var/run/docker.sock  # read-only API for the tool' \
+  | sudo tee -a /opt/<app>/compose-policy-allow
+echo 'app.ports:127.0.0.1:8080:80/tcp  # admin over an SSH tunnel' \
   | sudo tee -a /opt/<app>/compose-policy-allow
 sudo chmod 644 /opt/<app>/compose-policy-allow
 ```

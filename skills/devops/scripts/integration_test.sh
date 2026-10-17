@@ -10,8 +10,8 @@
 # with the pre-deploy dump, a broken healthcheck rolled back to
 # last-known-good, refused commands, a concurrent rollout refused by the lock,
 # restore of the dump, the compose policy refusing an include of a file
-# outside the image (a FIFO: reading it would hang) and an image label
-# routing a foreign host, check.sh, idempotent reruns of web-init and add-project,
+# outside the image (a FIFO: reading it would hang), an image label
+# routing a foreign host and a published port, check.sh, idempotent reruns of web-init and add-project,
 # add-project refusing names that collide through `_`,
 # auto-reboot at 04:00 and its removal on a rerun once a VPN unit shows up.
 # vpn-deploy on a fresh server is integration_vpn_test.sh.
@@ -120,7 +120,9 @@ SHA2=$(printf two | shasum | cut -c1-40)
 SHA3=$(printf bad | shasum | cut -c1-40)
 SHA4=$(printf include | shasum | cut -c1-40)
 SHA5=$(printf hijack | shasum | cut -c1-40)
+SHA6=$(printf ports | shasum | cut -c1-40)
 { echo 'include: [/opt/x.yml]'; cat "$W/app/docker-compose.yml"; } > "$W/app/include.yml"
+awk '{ print } /^  postgres:$/ { print "    ports: [\"5432:5432\"]" }' "$W/app/docker-compose.yml" > "$W/app/ports.yml"
 IMAGE=localhost:5000/ops/$APP
 tar -C "$W/app" -c . | admin "set -e
   rm -rf /tmp/app && mkdir /tmp/app && tar -x -C /tmp/app
@@ -130,7 +132,8 @@ tar -C "$W/app" -c . | admin "set -e
   docker build -q -t $IMAGE:$SHA3 --build-arg HEALTHY=0 /tmp/app >/dev/null
   docker build -q -t $IMAGE:$SHA4 --build-arg COMPOSE=include.yml /tmp/app >/dev/null
   docker build -q -t $IMAGE:$SHA5 --label 'traefik.http.routers.$APP.rule=Host(\`victim.example\`)' /tmp/app >/dev/null
-  for t in $SHA1 $SHA2 $SHA3 $SHA4 $SHA5; do docker push -q $IMAGE:\$t >/dev/null; docker image rm $IMAGE:\$t >/dev/null; done
+  docker build -q -t $IMAGE:$SHA6 --build-arg COMPOSE=ports.yml /tmp/app >/dev/null
+  for t in $SHA1 $SHA2 $SHA3 $SHA4 $SHA5 $SHA6; do docker push -q $IMAGE:\$t >/dev/null; docker image rm $IMAGE:\$t >/dev/null; done
   docker logout localhost:5000 >/dev/null"
 
 # --- add-project.sh -------------------------------------------------------
@@ -255,6 +258,11 @@ printf '%s\n' "$OUT" | tail -n 1
 check "image label routing a foreign host refused" \
   grep -q "compose of $SHA5 refused by the server policy: web.labels:traefik.http.routers.$APP.rule;.*production untouched" <<<"$OUT"
 check "foreign host: SHA2 keeps running" test "$(lkg) $(running_tag)" = "$SHA2 $SHA2"
+rc=0; OUT=$(deploy "deploy $SHA6" 2>&1) || rc=$?
+printf '%s\n' "$OUT" | tail -n 1
+check "published postgres port refused" \
+  grep -q "compose of $SHA6 refused by the server policy: postgres.ports:\*:5432:5432/tcp;.*production untouched" <<<"$OUT"
+check "published port: nothing listens on 5432" admin "! ss -Hltn 'sport = :5432' | grep -q ."
 
 say "refusals"
 for c in "ls" "deploy $SHA2; id" "deploy latest" "deploy  $SHA2" ""; do

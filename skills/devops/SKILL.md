@@ -146,7 +146,9 @@ What `deploy-app <app>` does on `ssh deployer@<host> "deploy <sha>"`:
   while it parses;
 - renders that compose with `docker compose config --format json
   --no-env-resolution` and checks it with `jq` before the dump and `up`:
-  `env_file` outside `/opt/<app>/`, `use_api_socket`, `provider`, privileged, host or `container:`
+  `env_file` outside `/opt/<app>/`, `use_api_socket`, `provider`, published
+  `ports` (one finding per port, `<svc>.ports:<ip>:<published>:<target>/<proto>`;
+  Docker bypasses ufw), privileged, host or `container:`
   namespaces, `cap_add`, `devices`, unconfined `security_opt`, binds that are
   not a direct child of `/opt/<app>/` or are a symlink (the Docker socket,
   deeper paths, `state/` included), foreign or external volumes and networks

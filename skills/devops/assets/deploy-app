@@ -93,6 +93,14 @@
 #                                        `..`), is compose-policy-allow or
 #                                        state/, or is a symlink on disk
 #   <svc>.env_file:<path>                an env_file by the same rule
+#   <svc>.ports:<ip>:<published>:<target>/<proto>
+#                                        a published port: Docker opens it
+#                                        past ufw. One token per port as
+#                                        compose renders it (a range gives
+#                                        one per port); <ip> * = every
+#                                        interface, IPv6 in brackets;
+#                                        <published> * = a random port.
+#                                        expose publishes nothing and passes
 #   volumes.<name>.external|driver|driver_opts|name
 #                                        external, a driver other than local,
 #                                        driver_opts (a bind in disguise), or
@@ -143,6 +151,7 @@
 #   # the vpn sidecar manages routes
 #   vpn.cap_add
 #   app.volumes:/srv/shared
+#   app.ports:127.0.0.1:8080:80/tcp
 # An exception for a deeper bind brings the symlink case back for that path:
 # root's call. The file must be a regular file of root, writable by root
 # alone; otherwise the run stops: deployer must not grant itself exceptions.
@@ -183,7 +192,9 @@ POLICY=$POLICY_DEFS'
       (select(any(.security_opt[]?; test("unconfined"))) | "security_opt"),
       (.volumes_from[]? | select(startswith("container:")) | "volumes_from:" + .),
       (.volumes[]? | select(.type == "bind") | .source | select(outside) | "volumes:" + .),
-      (env_files | select(outside) | "env_file:" + .)
+      (env_files | select(outside) | "env_file:" + .),
+      (.ports[]? | "ports:\(.host_ip // "" | if . == "" then "*" elif contains(":") then "[\(.)]" else . end)"
+        + ":\(.published // "" | tostring | if . == "" then "*" else . end):\(.target)/\(.protocol // "tcp")")
     ) | "\($svc).\(.)"),
   (.volumes // {} | to_entries[] | .key as $v | .value | (
       (select(.external == true) | "external"),
