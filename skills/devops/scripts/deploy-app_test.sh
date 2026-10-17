@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Traefik rules quote hosts in backticks
 # Unit tests for assets/deploy-app: argument and command parsing, the lock,
 # the image and registry taken from .env, the pre-deploy dump, the compose
 # policy gate before the rollout and before the rollback. No Docker
@@ -7,24 +8,27 @@
 # `docker exec` runs the dump script here with fake psql and pg_dump, and
 # `compose up` fails, so the run ends at the rollback; a tag listed in
 # FAKE_UP_TAGS comes up. `compose config` prints $CONFIGS/<tag>.json, else
-# $CONFIGS/default.json, and the real jq checks it. `image inspect` answers
-# the ID id-<tag>, and id-repushed once `compose pull` of the tag in
-# FAKE_REPUSH ran: the registry got a new image under the same tag. `docker run` of an
-# image ID prints the compose file "compose of <ID>" when FAKE_COMPOSE is
-# set and fails otherwise (no compose in the image); every compose call
-# appends the compose file it got on stdin to $COMPOSE_INPUTS. The full
-# rollout is covered by integration_test.sh.
+# $CONFIGS/default.json, with @TAG@ replaced by the tag, and the real jq
+# checks it. `image inspect` answers the ID id-<tag of the reference>, and
+# id-repushed for the app image once `compose pull` of the tag in
+# FAKE_REPUSH ran: the registry got a new image under the same tag; asked for labels, it prints
+# $CONFIGS/labels-<ID without sha256:>.json, else null. `docker run` of an
+# image ID prints the compose file "x-compose-of: <ID>" when FAKE_COMPOSE is
+# set and fails otherwise (no compose in the image: /opt/demo/docker-compose.yml
+# is used); every compose call appends the compose file it got on stdin to
+# $COMPOSE_INPUTS. The raw compose check runs the real python3 and PyYAML.
+# The full rollout is covered by integration_test.sh.
 #
-# deploy-app writes to /opt/<app> and needs flock(1) from util-linux and jq,
-# so on a machine without them the tests re-run themselves in a debian
-# container, which installs jq first.
+# deploy-app writes to /opt/<app> and needs flock(1) from util-linux, jq
+# and python3 with PyYAML, so on a machine without them the tests re-run
+# themselves in a debian container, which installs jq and python3-yaml first.
 #   bash deploy-app_test.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-if ! command -v flock >/dev/null || ! command -v jq >/dev/null || [[ ! -w /opt ]]; then
+if ! command -v flock >/dev/null || ! command -v jq >/dev/null || ! python3 -c 'import yaml' 2>/dev/null || [[ ! -w /opt ]]; then
   exec docker run --rm -v "${HERE%/scripts}:/skill:ro" debian:13 bash -c \
-    'export DEBIAN_FRONTEND=noninteractive && apt-get -qq update && apt-get -qq install -y jq > /dev/null && exec bash /skill/scripts/deploy-app_test.sh'
+    'export DEBIAN_FRONTEND=noninteractive && apt-get -qq update && apt-get -qq install -y jq python3-yaml > /dev/null && exec bash /skill/scripts/deploy-app_test.sh'
 fi
 
 DEPLOY_APP="${HERE%/scripts}/assets/deploy-app"
@@ -42,17 +46,23 @@ case "$1" in
   exec) shift 2; POSTGRES_USER=u POSTGRES_DB=app exec "$@" ;;
   image)
     ref=${*: -1}
-    [[ -e $DOCKER_CALLS.repushed ]] && echo sha256:id-repushed || echo "sha256:id-${ref##*:}" ;;
+    if [[ $* == *Labels* ]]; then
+      cat "$CONFIGS/labels-${ref#sha256:}.json" 2>/dev/null || echo null
+    elif [[ -e $DOCKER_CALLS.repushed && $ref == */demo:* ]]; then
+      echo sha256:id-repushed
+    else
+      echo "sha256:id-${ref##*:}"
+    fi ;;
   compose)
     printf '%s\n' "$stdin" >> "$COMPOSE_INPUTS"
     if [[ " $* " == *" config "* ]]; then
-      cat "$CONFIGS/$IMAGE_TAG.json" 2>/dev/null || cat "$CONFIGS/default.json"
+      { cat "$CONFIGS/$IMAGE_TAG.json" 2>/dev/null || cat "$CONFIGS/default.json"; } | sed "s/@TAG@/$IMAGE_TAG/g"
     elif [[ " $* " == *" pull "* ]]; then
       [[ ${FAKE_REPUSH:-} != "$IMAGE_TAG" ]] || touch "$DOCKER_CALLS.repushed"
     elif [[ " $* " == *" up "* ]]; then
       [[ " ${FAKE_UP_TAGS:-} " == *" $IMAGE_TAG "* ]]
     fi ;;
-  run) [[ -n ${FAKE_COMPOSE:-} ]] && echo "compose of ${*: -2:1}" ;;
+  run) [[ -n ${FAKE_COMPOSE:-} ]] && echo "x-compose-of: ${*: -2:1}" ;;
 esac
 EOF
 # The cluster of the fake postgres: databases app and glitchtip. pg_dump
@@ -87,17 +97,19 @@ config() {
     volumes: {postgres_data: {name: "demo_postgres_data"}}
   } * $top' > "$CONFIGS/$1.json"
 }
-CLEAN_APP='{"image": "git.example.com/ops/demo:t", "security_opt": ["no-new-privileges:true"], "networks": {"proxy": null, "backend": null}}'
+CLEAN_APP='{"image": "git.example.com/ops/demo:@TAG@", "security_opt": ["no-new-privileges:true"], "networks": {"proxy": null, "backend": null}}'
 config default "$CLEAN_APP"
 
 # A project directory as add-project.sh leaves it, with the given .env body.
+# docker-compose.yml is the fallback compose of images without one: the raw
+# file the YAML check reads (the rendered stack comes from $CONFIGS).
 project() {
   rm -rf "/opt/$1"
   mkdir -p "/opt/$1/state"
   printf '%s\n' "$2" > "/opt/$1/.env"
-  : > "/opt/$1/docker-compose.yml"
+  echo 'services: {}' > "/opt/$1/docker-compose.yml"
 }
-trap 'rm -rf "$TMP" /opt/demo /opt/other /opt/demo_x' EXIT
+trap 'rm -rf "$TMP" /opt/demo /opt/other /opt/demo_x /opt/demo-x' EXIT
 
 # case_ <name> <expected exit code> <expected output regex> <app args...>
 # SSH_ORIGINAL_COMMAND comes from the variable CMD.
@@ -107,7 +119,7 @@ case_() {
   : > "$DOCKER_CALLS"
   : > "$COMPOSE_INPUTS"
   rm -f "$DOCKER_CALLS.repushed"
-  out=$(SSH_ORIGINAL_COMMAND="$CMD" PATH="$BIN:$PATH" bash "$DEPLOY_APP" "$@" 2>&1 < /dev/null) || rc=$?
+  out=$(SSH_ORIGINAL_COMMAND="$CMD" PATH="$BIN:$PATH" timeout 60 bash "$DEPLOY_APP" "$@" 2>&1 < /dev/null) || rc=$?
   if [[ $rc -eq $want_rc && $out =~ $want ]]; then
     echo "ok   $name"
   else
@@ -129,7 +141,7 @@ check() {
   fi
 }
 
-DEMO_ENV=$'IMAGE=git.example.com/ops/demo\nREGISTRY_TOKEN=secret'
+DEMO_ENV=$'IMAGE=git.example.com/ops/demo\nREGISTRY_TOKEN=secret\nSITE_DOMAIN=demo.example\nALLOWED_HOSTS="www.demo.example, API.demo.example"'
 project demo "$DEMO_ENV"
 
 CMD="deploy $SHA"
@@ -322,6 +334,153 @@ unset FAKE_UP_TAGS
 rmdir /opt/demo/media
 rm "$CONFIGS/$SHA.json"
 
+# --- files outside the image ----------------------------------------------
+# Compose reads include, extends.file and label_file while it parses, even
+# with --no-env-resolution --no-path-resolution --no-interpolate, and would
+# inline another project's .env (root:deployer 640, readable by deployer).
+# So the raw YAML is checked by PyYAML before the first compose call, and
+# build is refused: deploy-app pulls, the image is the only source. The
+# targets are FIFOs: a reader would block until the timeout of case_.
+rm -f /opt/demo/state/last-known-good
+rm -rf /opt/other && mkdir /opt/other
+mkfifo /opt/other/x.yml /opt/other/.env
+raw() { printf '%s\n' "$1" > /opt/demo/docker-compose.yml; }
+raw_refuses() {
+  local name=$1 want=$2
+  case_ "raw: $name" 1 "compose of [0-9a-f]+ reads files from the host: ${want}; .*production untouched" demo
+  check "raw: $name: compose never runs" test -z "$(grep '^docker compose' "$DOCKER_CALLS")"
+}
+raw $'include:\n  - /opt/other/x.yml\nservices: {}';                    raw_refuses "include" 'include'
+raw '{"include": ["/opt/other/x.yml"], "services": {}}';                 raw_refuses "include in flow style" 'include'
+raw $'"inc\\x6cude": [/opt/other/x.yml]\nservices: {}';                  raw_refuses "include spelled with an escape" 'include'
+raw $'x-i: &i {include: [/opt/other/x.yml]}\n<<: *i\nservices: {}';     raw_refuses "include through a merge key" 'include'
+raw $'services:\n  app:\n    image: a\n    extends: {file: /opt/other/x.yml, service: s}'
+raw_refuses "extends with a file" 'app\.extends\.file'
+raw $'services:\n  app:\n    image: a\n    label_file: /opt/other/.env';    raw_refuses "label_file" 'app\.label_file'
+raw $'services:\n  app:\n    build: /opt/other';                          raw_refuses "build" 'app\.build'
+raw $'x-b: &b\n  build: {context: .}\nservices:\n  app:\n    <<: *b\n    image: a'
+raw_refuses "build through a merge key" 'app\.build'
+raw $'services:\n  app:\n    image: a\n    build: .\n    label_file: x\nincludes: x\ninclude: []'
+raw_refuses "every raw finding listed" 'include, app\.build, app\.label_file'
+# What the YAML check cannot judge the same way compose does is refused.
+raw_unparsed() {
+  case_ "raw: $1" 1 'compose of [0-9a-f]+ is not one plain YAML mapping.*production untouched' demo
+  check "raw: $1: compose never runs" test -z "$(grep '^docker compose' "$DOCKER_CALLS")"
+}
+raw $'!!binary aW5jbHVkZQ==: [/opt/other/x.yml]\nservices: {}';         raw_unparsed "an explicit tag"
+raw $'services: {}\n---\ninclude: [/opt/other/x.yml]';                    raw_unparsed "two documents"
+raw $'x-a: a include: [/opt/other/x.yml]\nservices: {}';           raw_unparsed "a unicode line separator"
+raw '- services';                                                       raw_unparsed "a list"
+raw 'services: [';                                                      raw_unparsed "broken YAML"
+check "nothing opened the include targets" test -p /opt/other/x.yml
+# extends inside the file reads nothing.
+raw $'services:\n  base: {image: a}\n  app:\n    extends: base'
+case_ "raw: extends of a service in the same file passes" 1 'no previous tag' demo
+raw 'services: {}'
+rm -rf /opt/other
+
+# --- what the gate reads from the rendered stack --------------------------
+# Rendered with --no-env-resolution: env_file stays a path, checked like a
+# bind (compose would inline the file into environment otherwise).
+case_ "render keeps env_file paths" 1 'no previous tag' demo
+check "config runs with --no-env-resolution" grep -q '^docker compose .* config --format json --no-env-resolution' "$DOCKER_CALLS"
+env_app() { refused_app "{\"env_file\": [{\"path\": \"$1\"}]}"; }
+env_app /opt/other/.env;        gate_refuses "env_file of another project" 'app\.env_file:/opt/other/\.env'
+env_app /opt/demo/../other/.env; gate_refuses "env_file with .." 'app\.env_file:/opt/demo/\.\./other/\.env'
+env_app /opt/demo/conf/app.env; gate_refuses "env_file deeper than a direct child" 'app\.env_file:/opt/demo/conf/app\.env'
+env_app /opt/demo/state/x.env;  gate_refuses "env_file in state/" 'app\.env_file:/opt/demo/state/x\.env'
+ln -s /opt/other/.env /opt/demo/link.env
+env_app /opt/demo/link.env;     gate_refuses "env_file that is a symlink" 'app\.env_file:/opt/demo/link\.env'
+rm /opt/demo/link.env
+refused_app '{"build": {"context": "/opt/demo"}}';     gate_refuses "build in the rendered stack" 'app\.build'
+refused_app '{"use_api_socket": true}';               gate_refuses "use_api_socket" 'app\.use_api_socket'
+refused_app '{"provider": {"type": "/opt/demo/uploads/x"}}'; gate_refuses "provider" 'app\.provider'
+refused_app '{"image": null}';                        gate_refuses "service without an image" 'app\.image'
+config "$SHA" "$(jq -c '. + {"env_file": [{"path": "/opt/demo/.env"}, {"path": "/opt/demo/app.env", "required": false}]}' <<<"$CLEAN_APP")"
+case_ "env_file of the project passes" 1 'no previous tag' demo
+rm "${CONFIGS:?}/$SHA.json"
+
+# --- Traefik labels -------------------------------------------------------
+# One Traefik serves every project: a router of demo for another project's
+# host takes its traffic and its certificate. Hosts come from SITE_DOMAIN and
+# ALLOWED_HOSTS in /opt/demo/.env (root's), names start with demo. Image
+# labels count: Docker puts them on the container, where Traefik reads them.
+labels_app() { refused_app "{\"labels\": $1}"; }
+GOOD_LABELS='{"traefik.enable": "true", "traefik.docker.network": "proxy",
+  "traefik.http.routers.demo.rule": "Host(`demo.example`)",
+  "traefik.http.routers.demo.entrypoints": "websecure",
+  "traefik.http.routers.demo.tls.certresolver": "letsencrypt",
+  "traefik.http.routers.demo.service": "demo",
+  "traefik.http.routers.demo.middlewares": "demo-strip",
+  "traefik.http.routers.demo-api.rule": "Host(\"demo.example\", `api.demo.example`) && PathPrefix(`/a||b`) && Method(`GET`)",
+  "traefik.http.routers.demo-api.service": "demo@docker",
+  "traefik.http.routers.demo-api.tls.domains[0].main": "demo.example",
+  "traefik.http.routers.demo-api.tls.domains[0].sans": "www.demo.example, api.demo.example",
+  "traefik.http.routers.demo-www.rule": "Host(`WWW.demo.example`) && Path(`/health`)",
+  "traefik.http.middlewares.demo-strip.headers.customResponseHeaders.Server": "",
+  "traefik.http.services.demo.loadbalancer.server.port": "8000"}'
+traefik_refuses() {
+  labels_app "$(jq -c ". + $1" <<<"$GOOD_LABELS")"
+  gate_refuses "$2" "$3"
+}
+traefik_refuses '{"traefik.http.routers.demo.rule": "Host(`other.example`)"}' "Host of another project" 'app\.labels:traefik\.http\.routers\.demo\.rule'
+traefik_refuses '{"traefik.http.routers.demo.rule": "Host(`demo.example`, `other.example`)"}' "a second Host outside the set" 'app\.labels:traefik\.http\.routers\.demo\.rule'
+traefik_refuses '{"traefik.http.routers.demo.rule": "Host(`demo.example`) || Host(`other.example`)"}' "||" 'app\.labels:traefik\.http\.routers\.demo\.rule'
+traefik_refuses '{"traefik.http.routers.demo.rule": "PathPrefix(`/`) && !Host(`demo.example`)"}' "negation" 'app\.labels:traefik\.http\.routers\.demo\.rule'
+traefik_refuses '{"traefik.http.routers.demo.rule": "PathPrefix(`/`)"}' "PathPrefix without Host" 'app\.labels:traefik\.http\.routers\.demo\.rule'
+traefik_refuses '{"traefik.http.routers.demo.rule": "HostRegexp(`.+`)"}' "HostRegexp" 'app\.labels:traefik\.http\.routers\.demo\.rule'
+traefik_refuses '{"traefik.http.routers.demo.rule": "Host(`demo.example`) && HostHeader(`x`)"}' "unknown matcher" 'app\.labels:traefik\.http\.routers\.demo\.rule'
+traefik_refuses '{"traefik.http.routers.demo.rule": "Host(`demo.example`) && Path(\u0001)"}' "placeholder character" 'app\.labels:traefik\.http\.routers\.demo\.rule'
+traefik_refuses '{"traefik.http.routers.demo.rule": "Host(\"demo.ex\\u0061mple\")"}' "escape in a host" 'app\.labels:traefik\.http\.routers\.demo\.rule'
+traefik_refuses '{"traefik.HTTP.Routers.demo.Rule": "Host(`other.example`)"}' "rule in another case" 'app\.labels:traefik\.http\.routers\.demo\.rule'
+traefik_refuses '{"traefik.http.routers.other.rule": "Host(`demo.example`)"}' "router of another name" 'app\.labels:traefik\.http\.routers\.other\.rule'
+traefik_refuses '{"traefik.http.routers.demox.rule": "Host(`demo.example`)"}' "router name without a dash" 'app\.labels:traefik\.http\.routers\.demox\.rule'
+traefik_refuses '{"traefik.http.routers.demo_x.rule": "Host(`demo.example`)"}' "router name with _" 'app\.labels:traefik\.http\.routers\.demo_x\.rule'
+traefik_refuses '{"traefik.http.services.other.loadbalancer.server.port": "80"}' "service of another name" 'app\.labels:traefik\.http\.services\.other\.loadbalancer\.server\.port'
+traefik_refuses '{"traefik.http.middlewares.other-auth.basicauth.users": "x"}' "middleware of another name" 'app\.labels:traefik\.http\.middlewares\.other-auth\.basicauth\.users'
+traefik_refuses '{"traefik.http.routers.demo.service": "api@internal"}' "router to api@internal" 'app\.labels:traefik\.http\.routers\.demo\.service'
+traefik_refuses '{"traefik.http.routers.demo.service": "other"}' "router to another service" 'app\.labels:traefik\.http\.routers\.demo\.service'
+traefik_refuses '{"traefik.http.routers.demo.tls.domains[1].main": "other.example"}' "certificate for another host" 'app\.labels:traefik\.http\.routers\.demo\.tls\.domains\[1\]\.main'
+traefik_refuses '{"traefik.http.routers.demo.tls.domains[0].sans": "www.demo.example,other.example"}' "certificate SAN for another host" 'app\.labels:traefik\.http\.routers\.demo\.tls\.domains\[0\]\.sans'
+traefik_refuses '{"traefik.http.routers.demo-b.entrypoints": "websecure"}' "router without a rule" 'app\.labels:traefik\.http\.routers\.demo-b\.rule'
+traefik_refuses '{"traefik.tcp.routers.demo.rule": "HostSNI(`*`)", "traefik.tcp.routers.demo.tls.passthrough": "true"}' "HostSNI *" 'app\.labels:traefik\.tcp\.routers\.demo\.rule'
+traefik_refuses '{"traefik.udp.routers.demo.entrypoints": "websecure"}' "udp router" 'app\.labels:traefik\.udp\.routers\.demo\.entrypoints'
+traefik_refuses '{"traefik.foo": "1"}' "unknown traefik key" 'app\.labels:traefik\.foo'
+labels_app '{"traefik.enable": "true"}'; gate_refuses "enabled without a router" 'app\.labels:traefik\.enable'
+mkdir /opt/demo-x
+traefik_refuses '{"traefik.http.routers.demo-x-api.rule": "Host(`demo.example`)"}' "router named into project demo-x" 'app\.labels:traefik\.http\.routers\.demo-x-api\.rule'
+rmdir /opt/demo-x
+# Image labels: the compose is clean, the image routes another host.
+labels_app "$GOOD_LABELS"
+echo '{"traefik.http.routers.demo-img.rule": "Host(`other.example`)", "maintainer": "x"}' > "$CONFIGS/labels-id-$SHA.json"
+gate_refuses "image label with another host" 'app\.labels:traefik\.http\.routers\.demo-img\.rule'
+echo '{"traefik.http.routers.demo.rule": "Host(`other.example`)"}' > "$CONFIGS/labels-id-18-alpine.json"
+gate_refuses "label of a third-party image" 'postgres\.labels:traefik\.http\.routers\.demo\.rule'
+rm "${CONFIGS:?}/labels-id-18-alpine.json"
+# A compose label overrides the image label of the same key, as in Docker.
+echo '{"traefik.http.routers.demo.rule": "Host(`other.example`)"}' > "$CONFIGS/labels-id-$SHA.json"
+export FAKE_UP_TAGS=$SHA
+case_ "traefik: clean labels deploy" 0 'rollout succeeded' demo
+rm "${CONFIGS:?}/labels-id-$SHA.json"
+# Without SITE_DOMAIN and ALLOWED_HOSTS no host is allowed.
+project demo $'IMAGE=git.example.com/ops/demo\nREGISTRY_TOKEN=secret'
+gate_refuses "no hosts in .env" 'app\.labels:traefik\.http\.routers\.demo\.rule.*SITE_DOMAIN.*ALLOWED_HOSTS'
+project demo "$DEMO_ENV"
+unset FAKE_UP_TAGS
+rm "${CONFIGS:?}/$SHA.json"
+
+# --- the images that start ------------------------------------------------
+# up starts every service from the image ID checked above, not from a tag:
+# a tag moved by another pull after the check changes nothing.
+export FAKE_UP_TAGS=$SHA
+case_ "pinned rollout" 0 'rollout succeeded' demo
+check "up gets the pin file and never builds" \
+  grep -q "^docker compose .* -f - -f /opt/demo/state/compose-pin\.json up .*--pull never --no-build" "$DOCKER_CALLS"
+check "every service pinned to its image ID" \
+  test "$(jq -c . /opt/demo/state/compose-pin.json)" = "{\"services\":{\"app\":{\"image\":\"sha256:id-$SHA\"},\"postgres\":{\"image\":\"sha256:id-18-alpine\"}}}"
+unset FAKE_UP_TAGS
+rm -f /opt/demo/state/last-known-good
+
 # --- exceptions -----------------------------------------------------------
 # Root grants an exception per token, one per line, exactly as the refusal
 # prints it. The file must be root's and writable by root alone, or the run
@@ -378,7 +537,7 @@ check "compose read from the image ID, never from the tag" \
   grep -qx "docker run --rm --pull never --entrypoint cat sha256:id-$SHA /app/docker-compose.yml" "$DOCKER_CALLS"
 check "compose read once" test "$(grep -c '^docker run ' "$DOCKER_CALLS")" = 1
 check "every compose call got the compose of that ID" \
-  test "$(sort -u "$COMPOSE_INPUTS")" = "compose of sha256:id-$SHA"
+  test "$(sort -u "$COMPOSE_INPUTS")" = "x-compose-of: sha256:id-$SHA"
 check "up never pulls" test -z "$(grep ' up ' "$DOCKER_CALLS" | grep -v -- ' --pull never ')"
 
 export FAKE_REPUSH=$SHA
@@ -396,7 +555,7 @@ check "rollback pulls PREVIOUS" grep -qx "docker pull --quiet ${APPREF}:${PREV}"
 check "rollback reads the compose of the PREVIOUS ID" \
   grep -qx "docker run --rm --pull never --entrypoint cat sha256:id-$PREV /app/docker-compose.yml" "$DOCKER_CALLS"
 check "rollback compose calls got the compose of the PREVIOUS ID" \
-  test "$(grep -c "compose of sha256:id-$PREV" "$COMPOSE_INPUTS")" -ge 3
+  test "$(grep -c "x-compose-of: sha256:id-$PREV" "$COMPOSE_INPUTS")" -ge 3
 check "rollback up never pulls" grep -q " up .*--pull never.*\[$PREV\]" "$DOCKER_CALLS"
 export FAKE_REPUSH=$PREV
 case_ "PREVIOUS re-pushed during its compose pull: no rollback" 1 "${APPREF}:${PREV} changed in the registry.*needs a human" demo

@@ -12,7 +12,15 @@
 # project in /opt/traefik (web-init), and `app` joins its external `proxy`
 # network. Router, service and middleware names are global for that Traefik,
 # so every name carries ${COMPOSE_PROJECT_NAME}: two projects with an
-# unprefixed `app` router make Traefik drop both.
+# unprefixed `app` router make Traefik drop both. deploy-app refuses a name
+# other than <project> or <project>-*, a rule that is not Host(...) joined
+# with && to other matchers (no ||, no !, no HostRegexp), and a host outside
+# SITE_DOMAIN and ALLOWED_HOSTS of .env; Traefik labels of the image count
+# too (assets/deploy-app, check 3).
+#
+# No build, include, extends from another file or label_file: deploy-app
+# refuses them, the image is the only source of the stack. An env_file must
+# be a direct child of /opt/<project>/.
 #
 # COMPOSE_PROJECT_NAME comes from .env (or --project-name of the deploy
 # script). It equals the Forgejo repository name: the image path is built from

@@ -167,7 +167,9 @@ Same image, other command, `backend` only, no labels:
 ## www Redirect (if needed)
 
 Add these labels to the app service. The middleware name carries the project
-prefix too: middlewares are global, like routers.
+prefix too: middlewares are global, like routers. Add `www.<domain>` to
+`ALLOWED_HOSTS` in `/opt/<app>/.env`: deploy-app refuses a rule for a host
+that is not in `SITE_DOMAIN` or `ALLOWED_HOSTS`.
 
 ```yaml
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-www.rule=Host(`www.${SITE_DOMAIN}`)"

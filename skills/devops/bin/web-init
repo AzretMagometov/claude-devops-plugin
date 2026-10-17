@@ -61,6 +61,8 @@ if [ "$ok" -ne ${#PKGS[@]} ]; then
   CHANGED+=("docker")
 fi
 command -v jq >/dev/null || apt-get install -y -q jq
+# deploy-app checks the raw compose file of a project with PyYAML before compose reads it
+python3 -c 'import yaml' 2>/dev/null || apt-get install -y -q python3-yaml
 systemctl enable -q --now docker
 
 # --- 2. daemon.json: add our keys, keep the others ---

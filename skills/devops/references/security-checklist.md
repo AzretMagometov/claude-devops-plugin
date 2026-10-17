@@ -63,9 +63,23 @@ adapting:
 
 `deployer` is in the `docker` group, and the compose file comes from the
 image, so whoever can push to main decides what runs as root on a server
-shared with other projects. `deploy-app` renders the stack of the tag with
-`docker compose config --format json` before the dump and `up`, and again
-before a rollback, and refuses it with `privileged`, a host or
+shared with other projects. `deploy-app` checks the stack of the tag in
+three steps before the dump and `up`, and again before a rollback.
+
+Files outside the image. Compose reads the files named by `include`,
+`extends.file` and `label_file` while it parses, whatever `--no-*` flags
+`config` gets, and inlines them; `env_file` too unless
+`--no-env-resolution`. Every `/opt/*/.env` is readable by `deployer`, so a
+compose with `env_file: /opt/other/.env` would get another project's
+secrets. Before the first compose call, `deploy-app` loads the raw file with
+python3 and PyYAML (web-init installs `python3-yaml`) and refuses `include`,
+`extends` with `file`, `label_file` and `build` (it pulls and never builds);
+no allow file entry lifts this. YAML that PyYAML and Compose could read
+differently is refused too: explicit tags, several documents, U+0085,
+U+2028, U+2029.
+
+The rendered stack. `docker compose config --format json
+--no-env-resolution` is checked with `jq`; it refuses `privileged`, a host or
 `container:` namespace (`network_mode`, `pid`, `ipc`, `uts`, `cgroup`,
 `userns_mode`), `cap_add`, `devices`, `device_cgroup_rules`, an
 `unconfined` `security_opt`, `volumes_from` another container, a bind mount
@@ -73,9 +87,36 @@ whose source is not a direct child of `/opt/<app>/` (the Docker socket,
 deeper paths and `..` included), is `state/` or the allow file, or is a
 symlink on disk, a named volume or network that is external, carries
 `driver_opts` or another project's name (the shared `proxy` network
-excepted), and `secrets`/`configs` files by the same rule as binds. The
-refusal names each finding, such as `app.cap_add`; the production stack stays
-as it was. A previous tag that fails the policy is not rolled back to.
+excepted), `secrets`/`configs` files and `env_file` paths by the same rule
+as binds, `use_api_socket`, `provider` (a program compose runs on the host),
+`build` and a service without `image`. The refusal names each finding, such
+as `app.cap_add`; the production stack stays as it was. A previous tag that
+fails the policy is not rolled back to.
+
+Traefik labels. One Traefik routes every project, so a router for another
+project's host would take its traffic and request its certificate. After
+`compose pull`, `deploy-app` checks the labels of each service: those of
+its image (Docker copies them onto the container, Traefik reads them there)
+with the compose labels over them, keys in lower case. It refuses
+(`<svc>.labels:<key>`):
+
+- router, service and middleware names other than `<app>` or `<app>-*`,
+  or `<other>-*` of a project `/opt/<other>` named `<app>-*`;
+- a rule that is not matchers joined by `&&` with at least one `Host` or
+  `HostSNI`: no `||`, no `!`, no `HostRegexp`; the other matchers allowed
+  are `Path`, `PathPrefix`, `PathRegexp`, `Method`, `Header`,
+  `HeaderRegexp`, `Query`, `QueryRegexp`, `ClientIP`, `ALPN`;
+- a host in a rule or in `tls.domains[n].main`/`.sans` that is not
+  `SITE_DOMAIN` or in `ALLOWED_HOSTS` of `/opt/<app>/.env`;
+- a router without a rule, `traefik.enable=true` without a router (both
+  get Traefik's default rule), a router service that is not the project's
+  (`api@internal`), a udp router, any other key under `traefik.`.
+
+A project with several hosts lists them in `ALLOWED_HOSTS`:
+
+```bash
+echo 'ALLOWED_HOSTS=www.example.com,api.example.com' | sudo tee -a /opt/<app>/.env
+```
 
 Why direct children only: root in a container is root on the host, so below
 a bound directory a container can plant a symlink, and the next rollout that
@@ -93,13 +134,18 @@ new project `demo_x` next to `demo`, or `demo` next to `demo_x`.
 The checked compose is the started one. `deploy-app` resolves the tag to an
 image ID after `docker pull`, reads the compose file from that ID once, and
 gives the same bytes to `config`, `pull` and `up`. After `compose pull` the
-tag must still name that ID, and `up --pull never` starts what is on disk. A
-tag pushed again in the meantime (the CI token writes to the registry) stops
-the run with "production untouched". The rollback pulls the previous tag
-explicitly and goes the same way.
+tag must still name that ID: a tag pushed again in the meantime (the CI
+token writes to the registry) stops the run with "production untouched".
+Every image of the stack is then resolved to its ID, and `up --pull never
+--no-build` gets `state/compose-pin.json`, which sets each service's image
+to that ID: a tag moved on the server after the check (another project
+pulling the same reference) changes nothing. `docker ps` shows these
+containers with an image ID. The rollback pulls the previous tag explicitly
+and goes the same way.
 
-An exception is a line in `/opt/<app>/compose-policy-allow` with the finding
-exactly as the refusal prints it; `#` starts a comment. Only root writes the
+An exception (rendered stack, Traefik labels) is a line in
+`/opt/<app>/compose-policy-allow` with the finding exactly as the refusal
+prints it; `#` starts a comment. Only root writes the
 file: `deploy-app` stops when it is not a regular file of root or is writable
 by group or others. An exception for a deeper bind brings the symlink case
 back for that path.

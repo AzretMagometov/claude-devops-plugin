@@ -27,6 +27,8 @@
 #                    the registry host is its first path segment
 #   REGISTRY_TOKEN   required; read:package token for the registry
 #   REGISTRY_USER    registry login, default the <owner> segment of IMAGE
+#   SITE_DOMAIN      the host the Traefik routers of the project may serve
+#   ALLOWED_HOSTS    more such hosts, separated by commas or spaces
 #
 # The compose file comes from the image (/app/docker-compose.yml), so a tag
 # means code and stack layout at once and a rollback brings the old stack back.
@@ -38,29 +40,59 @@
 # resolved to its image ID once; the compose file is read once from that ID
 # (`docker run` of an ID never pulls) and kept in memory, and every compose
 # call of the run gets those bytes. After `compose pull`, which pulls the app
-# tag again with the rest of the stack, the tag must still name that ID, and
-# `up --pull never` starts what is on disk: a tag re-pushed in between stops
-# the run before production changes. The rollback pulls the previous tag
-# explicitly (the weekly prune may have removed it) and goes the same way.
+# tag again with the rest of the stack, the tag must still name that ID: a
+# tag re-pushed in between stops the run before production changes. Every
+# other image of the stack is resolved to its ID after that pull too, its
+# labels are checked (below), and `up` gets a second compose file,
+# state/compose-pin.json, that sets each service's image to that ID: what
+# starts is what was checked, even if a later pull on the server (another
+# project's rollout, say) moves a tag before `up`. `docker ps` shows these
+# containers with an image ID instead of a name. The rollback pulls the
+# previous tag explicitly (the weekly prune may have removed it) and goes the
+# same way.
 #
 # Compose policy. deployer is in the docker group and the compose file comes
 # from whoever can push to main, so the file decides what runs as root on a
 # server shared with other projects. Before any change to production, and
-# again before a rollback, the stack of the tag is rendered with
-# `docker compose config --format json` and checked with jq. A finding is a
-# token, <service>.<key> or <top-level section>.<name>.<key>:
+# again before a rollback, the stack of the tag goes through three checks.
+#
+# 1. Files outside the image. Compose reads the files named by include,
+# extends.file and label_file while it parses, with every --no-* flag of
+# `config` (Compose v5, checked), and inlines them; every /opt/<other>/.env
+# is readable by deployer, so that would hand one project another's secrets,
+# and an error message could print them. So before the first compose call
+# python3 with PyYAML loads the raw text and refuses, whatever the
+# allow file says:
+#   include                    at the top level
+#   <svc>.extends.file         extends of a service in another file
+#   <svc>.label_file
+#   <svc>.build                deploy-app pulls and never builds
+# Merge keys are resolved first, so `<<: *anchor` hides nothing. YAML that
+# PyYAML and Compose could read differently is refused as not one plain
+# YAML mapping: an explicit tag (`!!binary` turns a key into bytes for
+# PyYAML), more than one document, U+0085/U+2028/U+2029 (line breaks to
+# YAML 1.1 only), anything but a mapping at the top.
+#
+# 2. The rendered stack. `docker compose config --format json
+# --no-env-resolution` (env_file stays a path, not read) is checked with jq.
+# A finding is a token, <service>.<key> or <top-level section>.<name>.<key>:
 #   <svc>.privileged                     privileged: true
 #   <svc>.network_mode|pid|ipc|uts|cgroup|userns_mode
 #                                        host, or container:<other>
 #   <svc>.cap_add|devices|device_cgroup_rules
 #                                        not empty
 #   <svc>.security_opt                   an *unconfined* apparmor or seccomp
+#   <svc>.use_api_socket                 the Docker API inside the container
+#   <svc>.provider                       a program compose runs on the host
+#   <svc>.build                          as in check 1
+#   <svc>.image                          none: nothing to pin (below)
 #   <svc>.volumes_from:container:<name>  volumes of a container outside the stack
 #   <svc>.volumes:<source>               a bind mount whose source is not a
 #                                        direct child of /opt/<app>/ (the
 #                                        docker socket too, anything deeper,
 #                                        `..`), is compose-policy-allow or
 #                                        state/, or is a symlink on disk
+#   <svc>.env_file:<path>                an env_file by the same rule
 #   volumes.<name>.external|driver|driver_opts|name
 #                                        external, a driver other than local,
 #                                        driver_opts (a bind in disguise), or
@@ -79,16 +111,47 @@
 # `up`. state/ is deployer's (last-known-good, registry login), not the
 # stack's. Volume and network names: compose names them <app>_<name>, and
 # with a project demo_x on the server, volume x_data of demo is demo_x_data,
-# the volume data of demo_x; such a name is a finding too. Any finding stops
-# the run. Root grants
-# an exception in /opt/<app>/compose-policy-allow: one token per line,
-# exactly as the refusal prints it; `#` starts a comment.
+# the volume data of demo_x; such a name is a finding too.
+#
+# 3. Traefik labels. One Traefik routes every project, so a router of one
+# project for another's host would take its traffic and get a certificate
+# for it. After `compose pull` the labels of each service are those of its
+# image (Docker copies them onto the container, Traefik reads them there)
+# overlaid with those of the compose file. Keys are compared in lower case,
+# as Traefik reads them. Findings, <svc>.labels:<key>:
+#   - a key under traefik. other than traefik.enable, traefik.docker.*,
+#     traefik.{http,tcp,udp}.{routers,services,middlewares,serverstransports}.<name>.*;
+#   - a <name> other than <app> or <app>-*, or one that is <other> or
+#     <other>-* of a project /opt/<other> named <app>-*;
+#   - a udp router: it has no host to confine it;
+#   - a router rule that is not matchers joined by &&, with at least one
+#     Host or HostSNI and every host in the allowed set: no ||, no !, no
+#     HostRegexp; the other matchers are Path, PathPrefix, PathRegexp,
+#     Method, Header, HeaderRegexp, Query, QueryRegexp, ClientIP, ALPN;
+#   - a router without a rule (Traefik would give it its default rule),
+#     and traefik.enable=true without any router (a default router);
+#   - a router service that is not a name of the project (api@internal
+#     would publish the Traefik API);
+#   - tls.domains[n].main or .sans with a host outside the set.
+# The allowed set is SITE_DOMAIN plus ALLOWED_HOSTS from .env, which root
+# writes: a project with several hosts lists them in ALLOWED_HOSTS, one
+# router per host or Host(`a`, `b`).
+#
+# Any finding stops the run. Root grants an exception (checks 2 and 3) in
+# /opt/<app>/compose-policy-allow: one token per line, exactly as the
+# refusal prints it; `#` starts a comment.
 #   # the vpn sidecar manages routes
 #   vpn.cap_add
 #   app.volumes:/srv/shared
 # An exception for a deeper bind brings the symlink case back for that path:
 # root's call. The file must be a regular file of root, writable by root
 # alone; otherwise the run stops: deployer must not grant itself exceptions.
+#
+# What the policy leaves open: secrets.<name>.environment reads a variable of
+# compose's own environment (this script's and .env), nothing of another
+# project. Interpolation sees the caller's LANG and LC_* when sshd accepts
+# them, which only changes values the checks above then see. The
+# application code itself is not limited (README, Trust model).
 set -euo pipefail
 
 HEALTH_TIMEOUT=180
@@ -105,18 +168,22 @@ POLICY_DEFS='
   def outside: [child | select(. != "" and . != "." and . != ".." and . != "state"
     and . != "compose-policy-allow" and (contains("/") | not))] | length == 0;
   def foreign: (startswith($app + "_") | not) or (. as $n | any($longer[]; . as $o | $n | startswith($o + "_")));
+  def env_files: .env_file[]? | .path;
 '
 # shellcheck disable=SC2016 # jq variables
 POLICY=$POLICY_DEFS'
   (.services // {} | to_entries[] | .key as $svc | .value | (
       (select(.privileged == true) | "privileged"),
+      (("use_api_socket", "provider", "build") as $k | select(.[$k] // false | . != false) | $k),
+      (select(.image == null) | "image"),
       (("network_mode", "pid", "ipc", "uts", "cgroup", "userns_mode") as $k
         | select(.[$k] | ns_escape) | $k),
       (("cap_add", "devices", "device_cgroup_rules") as $k
         | select(.[$k] // [] | length > 0) | $k),
       (select(any(.security_opt[]?; test("unconfined"))) | "security_opt"),
       (.volumes_from[]? | select(startswith("container:")) | "volumes_from:" + .),
-      (.volumes[]? | select(.type == "bind") | .source | select(outside) | "volumes:" + .)
+      (.volumes[]? | select(.type == "bind") | .source | select(outside) | "volumes:" + .),
+      (env_files | select(outside) | "env_file:" + .)
     ) | "\($svc).\(.)"),
   (.volumes // {} | to_entries[] | .key as $v | .value | (
       (select(.external == true) | "external"),
@@ -138,9 +205,87 @@ POLICY=$POLICY_DEFS'
 BIND_SOURCES=$POLICY_DEFS'
   (.services // {} | to_entries[] | .key as $svc | .value.volumes[]?
     | select(.type == "bind" and (.source | outside | not)) | "\($svc).volumes:\(.source)\t\(.source)"),
+  (.services // {} | to_entries[] | .key as $svc | .value | env_files
+    | select(outside | not) | "\($svc).env_file:\(.)\t\(.)"),
   (("secrets", "configs") as $sec | .[$sec] // {} | to_entries[]
     | select(.value.file != null and (.value.file | outside | not))
     | "\($sec).\(.key).file\t\(.value.file)")
+'
+
+# Check 3 (header) over the rendered JSON, with $img: image reference →
+# labels of that image after the pull, $hosts: the allowed hosts in lower
+# case, $dashed: the projects named <app>-*. Rule strings are cut into
+# quoted arguments and the rest; the rest must be matchers joined by &&.
+# shellcheck disable=SC2016 # jq variables
+TRAEFIK='
+  def own: ascii_downcase as $n | ($n | test("@") | not)
+    and ($n == $app or ($n | startswith($app + "-")))
+    and (any($dashed[]; . as $o | $n == $o or ($n | startswith($o + "-"))) | not);
+  def host_ok: ascii_downcase as $h | any($hosts[]; . == $h);
+  "`[^`]*`|\"(?:[^\"\\\\]|\\\\.)*\"" as $quoted
+  | "\u0001" as $p
+  | ("[A-Za-z]+\\(\\s*" + $p + "(?:\\s*,\\s*" + $p + ")*\\s*\\)") as $call
+  | def rule_ok:
+      . as $r | ($r | gsub($quoted; $p)) as $q
+      | [$r | match($quoted; "g") | .string | .[1:-1]] as $args
+      | if ($q | test("^\\s*" + $call + "(?:\\s*&&\\s*" + $call + ")*\\s*$") | not)
+          or ([$q | scan($p)] | length) != ($args | length) then false
+        else
+          (reduce ($q | scan("([A-Za-z]+)\\(([^)]*)\\)")) as $c ({i: 0, m: []};
+            ([$c[1] | scan($p)] | length) as $n
+            | .m += [{name: ($c[0] | ascii_downcase), args: $args[.i:.i + $n]}] | .i += $n)).m
+          | all(.[]; .name | IN("host", "hostsni", "path", "pathprefix", "pathregexp", "method",
+              "header", "headerregexp", "query", "queryregexp", "clientip", "alpn"))
+            and any(.[]; .name | IN("host", "hostsni"))
+            and all(.[] | select(.name | IN("host", "hostsni")) | .args[]; host_ok)
+        end;
+  [ .services // {} | to_entries[] | .key as $svc
+    | [($img[.value.image // ""] // {}) + (.value.labels // {}) | to_entries[]
+        | {k: (.key | ascii_downcase), v: (.value | tostring)}] as $l
+    | ( ($l[] | .k as $k | .v as $v
+          | ($k | capture("^traefik\\.(?<proto>http|tcp|udp)\\.(?<kind>routers|services|middlewares|serverstransports)\\.(?<name>[^.]+)\\.(?<rest>.+)$") // null) as $c
+          | if $c == null then select($k | startswith("traefik.")) | select($k != "traefik.enable" and ($k | startswith("traefik.docker.") | not)) | $k
+            elif ($c.name | own | not) or ($c.proto == "udp" and $c.kind == "routers") then $k
+            elif $c.kind != "routers" then empty
+            elif $c.rest == "rule" then select($v | rule_ok | not) | $k
+            elif $c.rest == "service" then select($v | sub("@docker$"; "") | own | not) | $k
+            elif ($c.rest | test("^tls\\.domains\\[[0-9]+\\]\\.(main|sans)$")) then
+              select(any($v | split(",")[] | gsub("^\\s+|\\s+$"; ""); host_ok | not)) | $k
+            else empty end),
+        ([$l[].k | capture("^traefik\\.(?<proto>http|tcp)\\.routers\\.(?<name>[^.]+)\\.") // empty
+          | "traefik.\(.proto).routers.\(.name).rule"] | unique - [$l[].k])[],
+        (select(any($l[]; .k == "traefik.enable" and (.v | ascii_downcase) == "true")
+          and (any($l[]; .k | test("^traefik\\.(http|tcp)\\.routers\\.")) | not)) | "traefik.enable")
+      ) | "\($svc).labels:\(.)"
+  ] | unique[]
+'
+# Check 1 (header): the raw compose file on stdin, nothing else opened.
+# Prints the findings one per line; fails, with the reason, on YAML it does
+# not judge.
+RAW_CHECK='
+import sys, yaml
+text = sys.stdin.read()
+if any(c in text for c in "\x85\u2028\u2029"):
+    sys.exit("U+0085, U+2028 or U+2029 in the text")
+try:
+    if any(getattr(e, "tag", None) is not None for e in yaml.parse(text, Loader=yaml.SafeLoader)):
+        sys.exit("an explicit YAML tag")
+    doc = yaml.safe_load(text)
+except yaml.YAMLError as e:
+    sys.exit(str(e).replace("\n", " "))
+if not isinstance(doc, dict) or not isinstance(doc.get("services"), (dict, type(None))):
+    sys.exit("the top level is not a mapping with a services mapping")
+services = doc.get("services")
+if "include" in doc:
+    print("include")
+for name, svc in (services or {}).items():
+    if not isinstance(svc, dict):
+        continue
+    for key in ("build", "label_file"):
+        if key in svc:
+            print(f"{name}.{key}")
+    if isinstance(svc.get("extends"), dict) and "file" in svc["extends"]:
+        print(f"{name}.extends.file")
 '
 
 log() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -174,6 +319,8 @@ exec 9> "$STATE_DIR/deploy.lock"
 flock -n 9 || die "another rollout of ${APP} is running, retry later"
 
 command -v jq > /dev/null || die "jq is not installed, the compose policy cannot run (web-init installs it)"
+python3 -c 'import yaml' 2> /dev/null \
+  || die "python3 with PyYAML is not installed, the compose policy cannot run (web-init installs python3-yaml)"
 
 # --- compose policy exceptions ---------------------------------------------
 ALLOW_FILE=$PROJECT_DIR/compose-policy-allow
@@ -207,6 +354,13 @@ REGISTRY_USER=$(env_get REGISTRY_USER)
 [[ -n $REGISTRY_USER ]] || die "no REGISTRY_USER in ${PROJECT_DIR}/.env, and IMAGE=${IMAGE} has no owner"
 TOKEN=$(env_get REGISTRY_TOKEN)
 [[ -n $TOKEN ]] || die "no REGISTRY_TOKEN in ${PROJECT_DIR}/.env"
+# The hosts the Traefik routers may serve, lower case, as a JSON array.
+HOSTS=$({ env_get SITE_DOMAIN; echo; env_get ALLOWED_HOSTS; } | tr ',[:space:]' '[\n*]' | tr '[:upper:]' '[:lower:]' \
+  | jq -Rnc '[inputs | select(. != "")]')
+# The projects whose names start with this one's: compose names their volumes
+# <app>_*, Traefik names of <app>-* are theirs.
+LONGER=$(find /opt -mindepth 1 -maxdepth 1 -type d -name "${APP}_*" -printf '%f\n' | jq -Rnc '[inputs]')
+DASHED=$(find /opt -mindepth 1 -maxdepth 1 -type d -name "${APP}-*" -printf '%f\n' | jq -Rnc '[inputs]')
 
 STATE_FILE=$STATE_DIR/last-known-good
 PREVIOUS=$(cat "$STATE_FILE" 2>/dev/null || true)
@@ -223,8 +377,8 @@ printf '%s' "$TOKEN" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-s
 # A tag missing from the registry shows here, before any container changes.
 docker pull --quiet "${IMAGE}:${TAG}" > /dev/null || die "image ${IMAGE}:${TAG} did not download; production untouched"
 
-# image_id <tag>: the local image the tag names now.
-image_id() { docker image inspect --format '{{.Id}}' "${IMAGE}:$1" 2>/dev/null; }
+# image_id <reference>: the local image the reference names now.
+image_id() { docker image inspect --format '{{.Id}}' "$1" 2>/dev/null; }
 
 # compose_of <image id> <tag>: the compose file inside that image, read by ID.
 compose_of() {
@@ -236,6 +390,7 @@ compose_of() {
 
 # compose <tag> <compose file text> <args...>. The compose file arrives on
 # stdin, so the project name is given explicitly: volumes are bound to <app>_*.
+# Arguments may start with more `-f <file>`.
 compose() {
   IMAGE="$IMAGE" IMAGE_TAG="$1" docker compose \
     --project-name "$APP" \
@@ -244,36 +399,66 @@ compose() {
     -f - "${@:3}" <<< "$2"
 }
 
-# policy_findings <tag> <compose file text>: the findings of that stack not
-# granted by the allow file, comma-separated; fails when compose cannot
-# render it.
-policy_findings() {
-  local json
-  json=$(compose "$1" "$2" config --format json) && [[ -n $json ]] || return 1
-  # The projects named <app>_*: their volumes and networks are <app>_* too.
-  local longer
-  longer=$(find /opt -mindepth 1 -maxdepth 1 -type d -name "${APP}_*" -printf '%f\n' | jq -Rnc '[inputs]')
-  local jq_args=(-r --arg app "$APP" --arg dir "$PROJECT_DIR" --argjson longer "$longer")
-  {
-    jq "${jq_args[@]}" "$POLICY" <<< "$json"
-    jq "${jq_args[@]}" "$BIND_SOURCES" <<< "$json" | while IFS=$'\t' read -r token src; do
+# not_granted: the findings on stdin that the allow file does not grant,
+# comma-separated.
+not_granted() { { grep -Fxv -f <(allowed_tokens) || true; } | paste -sd, - | sed 's/,/, /g'; }
+
+PIN_FILE=$STATE_DIR/compose-pin.json
+JQ_ARGS=(-r --arg app "$APP" --arg dir "$PROJECT_DIR" --argjson longer "$LONGER"
+  --argjson dashed "$DASHED" --argjson hosts "$HOSTS")
+
+# vet <rollout|rollback> <tag> <image id> <compose file text>: the three
+# checks of the compose policy (header), with `compose pull` between the
+# second and the third, and PIN_FILE for `up`. Stops the run on a finding;
+# changes nothing in production.
+vet() {
+  local phase=$1 tag=$2 id=$3 text=$4 what after
+  if [[ $phase == rollout ]]; then what="compose of ${tag}" after="production untouched"
+  else what="previous tag ${tag}" after="not rolling back, needs a human"; fi
+  local grant="root may grant exceptions in ${ALLOW_FILE}"
+
+  local raw
+  raw=$(python3 -I -c "$RAW_CHECK" <<< "$text" 2>&1) \
+    || die "${what} is not one plain YAML mapping (${raw}); ${after}"
+  [[ -z $raw ]] || die "${what} reads files from the host: $(paste -sd, - <<< "$raw" | sed 's/,/, /g'); the image is the only source of the stack; ${after}"
+
+  local json findings
+  json=$(compose "$tag" "$text" config --format json --no-env-resolution) && [[ -n $json ]] \
+    || die "${what} does not render; ${after}"
+  findings=$({
+    jq "${JQ_ARGS[@]}" "$POLICY" <<< "$json"
+    jq "${JQ_ARGS[@]}" "$BIND_SOURCES" <<< "$json" | while IFS=$'\t' read -r token src; do
       [[ ! -L $src ]] || printf '%s\n' "$token"
     done
-  } | { grep -Fxv -f <(allowed_tokens) || true; } | paste -sd, - | sed 's/,/, /g'
+  } | not_granted)
+  [[ -z $findings ]] || die "${what} refused by the server policy: ${findings}; ${grant}; ${after}"
+
+  compose "$tag" "$text" pull --quiet || die "stack images for ${tag} did not download; ${after}"
+  [[ $(image_id "${IMAGE}:${tag}") == "$id" ]] \
+    || die "image ${IMAGE}:${tag} changed in the registry during the ${phase} (was ${id}); ${after}"
+
+  # Every image of the stack by ID, and its labels: {ref: id}, {ref: labels}.
+  local ids='{}' labels='{}' refs ref ref_id ref_labels
+  mapfile -t refs < <(jq -r '[.services[].image] | unique[]' <<< "$json")
+  for ref in "${refs[@]}"; do
+    if [[ $ref == "${IMAGE}:${tag}" ]]; then ref_id=$id
+    else ref_id=$(image_id "$ref") || die "image ${ref} is not on disk after the pull; ${after}"; fi
+    ids=$(jq -c --arg r "$ref" --arg i "$ref_id" '.[$r] = $i' <<< "$ids")
+    ref_labels=$(docker image inspect --format '{{json .Config.Labels}}' "$ref_id") \
+      || die "labels of image ${ref} unreadable; ${after}"
+    labels=$(jq -c --arg r "$ref" --argjson l "$ref_labels" '.[$r] = ($l // {})' <<< "$labels")
+  done
+  findings=$(jq "${JQ_ARGS[@]}" --argjson img "$labels" "$TRAEFIK" <<< "$json" | not_granted)
+  [[ -z $findings ]] \
+    || die "${what} refused by the server policy: ${findings}; hosts come from SITE_DOMAIN and ALLOWED_HOSTS in ${PROJECT_DIR}/.env; ${grant}; ${after}"
+  jq -c --argjson ids "$ids" '{services: (.services | map_values({image: $ids[.image]}))}' <<< "$json" > "$PIN_FILE"
 }
 
-TAG_ID=$(image_id "$TAG") || die "image ${IMAGE}:${TAG} is not on disk after the pull; production untouched"
+TAG_ID=$(image_id "${IMAGE}:${TAG}") || die "image ${IMAGE}:${TAG} is not on disk after the pull; production untouched"
 TAG_COMPOSE=$(compose_of "$TAG_ID" "$TAG") || die "no compose file for ${TAG}; production untouched"
 
-# Before the stack images are pulled, the dump and up: a refused stack
-# changes nothing.
-FINDINGS=$(policy_findings "$TAG" "$TAG_COMPOSE") || die "compose of ${TAG} does not render; production untouched"
-[[ -z $FINDINGS ]] \
-  || die "compose of ${TAG} refused by the server policy: ${FINDINGS}; root may grant exceptions in ${ALLOW_FILE}; production untouched"
-
-compose "$TAG" "$TAG_COMPOSE" pull --quiet || die "stack images for ${TAG} did not download; production untouched"
-[[ $(image_id "$TAG") == "$TAG_ID" ]] \
-  || die "image ${IMAGE}:${TAG} changed in the registry during the rollout (was ${TAG_ID}); production untouched"
+# Before the dump and up: a refused stack changes nothing.
+vet rollout "$TAG" "$TAG_ID" "$TAG_COMPOSE"
 
 # --- database dump before migrations --------------------------------------
 # One rolling file, overwritten by every rollout: the state just before the
@@ -312,7 +497,7 @@ fi
 # `up --wait` starts services in dependency order: the one-shot migrate
 # finishes before the app starts. Health is the container healthcheck, not a
 # request through Traefik, which answers 404 for an unhealthy container.
-if compose "$TAG" "$TAG_COMPOSE" up -d --pull never --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
+if compose "$TAG" "$TAG_COMPOSE" -f "$PIN_FILE" up -d --pull never --no-build --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
   echo "$TAG" > "$STATE_FILE"
   log "rollout succeeded, ${TAG} recorded as last known good"
   docker image prune -f > /dev/null
@@ -336,20 +521,13 @@ compose "$TAG" "$TAG_COMPOSE" logs --tail 40 --no-color >&2 || true
   || die "last-known-good holds \"${PREVIOUS}\", not a tag: not rolling back, needs a human"
 docker pull --quiet "${IMAGE}:${PREVIOUS}" > /dev/null \
   || die "image ${IMAGE}:${PREVIOUS} did not download: not rolling back, needs a human"
-PREV_ID=$(image_id "$PREVIOUS") \
+PREV_ID=$(image_id "${IMAGE}:${PREVIOUS}") \
   || die "image ${IMAGE}:${PREVIOUS} is not on disk after the pull: not rolling back, needs a human"
 PREV_COMPOSE=$(compose_of "$PREV_ID" "$PREVIOUS") \
   || die "no compose file for ${PREVIOUS}: not rolling back, needs a human"
-FINDINGS=$(policy_findings "$PREVIOUS" "$PREV_COMPOSE") \
-  || die "compose of the previous tag ${PREVIOUS} does not render: not rolling back, needs a human"
-[[ -z $FINDINGS ]] \
-  || die "previous tag ${PREVIOUS} refused by the server policy: ${FINDINGS}; not rolling back, needs a human"
-compose "$PREVIOUS" "$PREV_COMPOSE" pull --quiet \
-  || die "stack images for ${PREVIOUS} did not download: not rolling back, needs a human"
-[[ $(image_id "$PREVIOUS") == "$PREV_ID" ]] \
-  || die "image ${IMAGE}:${PREVIOUS} changed in the registry during the rollback (was ${PREV_ID}): not rolling back, needs a human"
+vet rollback "$PREVIOUS" "$PREV_ID" "$PREV_COMPOSE"
 
-if compose "$PREVIOUS" "$PREV_COMPOSE" up -d --pull never --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
+if compose "$PREVIOUS" "$PREV_COMPOSE" -f "$PIN_FILE" up -d --pull never --no-build --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
   die "rollout of ${TAG} failed, ${APP} rolled back to ${PREVIOUS}"
 fi
 die "rollout of ${TAG} failed AND the rollback to ${PREVIOUS} did not come up: needs a human"

@@ -9,7 +9,9 @@
 # htpasswd auth on localhost:5000 there. Checks: first rollout, a second one
 # with the pre-deploy dump, a broken healthcheck rolled back to
 # last-known-good, refused commands, a concurrent rollout refused by the lock,
-# restore of the dump, check.sh, idempotent reruns of web-init and add-project,
+# restore of the dump, the compose policy refusing an include of a file
+# outside the image (a FIFO: reading it would hang) and an image label
+# routing a foreign host, check.sh, idempotent reruns of web-init and add-project,
 # add-project refusing names that collide through `_`,
 # auto-reboot at 04:00 and its removal on a rerun once a VPN unit shows up.
 # vpn-deploy on a fresh server is integration_vpn_test.sh.
@@ -108,13 +110,17 @@ cat > "$W/app/Dockerfile" <<'EOF'
 FROM busybox:1.37
 ARG HEALTHY=1
 RUN mkdir /www && echo up > /www/index.html && if [ "$HEALTHY" = 1 ]; then echo ok > /www/health; fi
-COPY docker-compose.yml /app/docker-compose.yml
+ARG COMPOSE=docker-compose.yml
+COPY ${COMPOSE} /app/docker-compose.yml
 USER 1000:1000
 CMD ["httpd", "-f", "-p", "8000", "-h", "/www"]
 EOF
 SHA1=$(printf one | shasum | cut -c1-40)
 SHA2=$(printf two | shasum | cut -c1-40)
 SHA3=$(printf bad | shasum | cut -c1-40)
+SHA4=$(printf include | shasum | cut -c1-40)
+SHA5=$(printf hijack | shasum | cut -c1-40)
+{ echo 'include: [/opt/x.yml]'; cat "$W/app/docker-compose.yml"; } > "$W/app/include.yml"
 IMAGE=localhost:5000/ops/$APP
 tar -C "$W/app" -c . | admin "set -e
   rm -rf /tmp/app && mkdir /tmp/app && tar -x -C /tmp/app
@@ -122,7 +128,9 @@ tar -C "$W/app" -c . | admin "set -e
   docker build -q -t $IMAGE:$SHA1 /tmp/app >/dev/null
   docker build -q -t $IMAGE:$SHA2 --build-arg HEALTHY=1 --label second=1 /tmp/app >/dev/null
   docker build -q -t $IMAGE:$SHA3 --build-arg HEALTHY=0 /tmp/app >/dev/null
-  for t in $SHA1 $SHA2 $SHA3; do docker push -q $IMAGE:\$t >/dev/null; docker image rm $IMAGE:\$t >/dev/null; done
+  docker build -q -t $IMAGE:$SHA4 --build-arg COMPOSE=include.yml /tmp/app >/dev/null
+  docker build -q -t $IMAGE:$SHA5 --label 'traefik.http.routers.$APP.rule=Host(\`victim.example\`)' /tmp/app >/dev/null
+  for t in $SHA1 $SHA2 $SHA3 $SHA4 $SHA5; do docker push -q $IMAGE:\$t >/dev/null; docker image rm $IMAGE:\$t >/dev/null; done
   docker logout localhost:5000 >/dev/null"
 
 # --- add-project.sh -------------------------------------------------------
@@ -198,13 +206,22 @@ admin "sudo rm -rf /opt/apitest_v2"
 
 # --- rollouts -------------------------------------------------------------
 lkg() { admin "cat /opt/$APP/state/last-known-good"; }
-running_tag() { admin "docker inspect -f '{{.Config.Image}}' $APP-web-1" | sed 's/.*://'; }
+# up starts every service from its image ID: the tag is the one whose ID the
+# container runs.
+running_tag() {
+  local id t
+  id=$(admin "docker inspect -f '{{.Image}}' $APP-web-1")
+  for t in $SHA1 $SHA2 $SHA3; do
+    [ "$(admin "docker image inspect -f '{{.Id}}' $IMAGE:$t 2>/dev/null")" = "$id" ] && echo "$t"
+  done
+}
 rows() { admin "docker exec $APP-postgres-1 psql -U demo -d demo -tAc 'SELECT count(*) FROM deploys'"; }
 
 say "first rollout $SHA1"
 check "first rollout succeeds" deploy "deploy $SHA1"
 check "last-known-good = SHA1" test "$(lkg)" = "$SHA1"
 check "web runs SHA1" test "$(running_tag)" = "$SHA1"
+check "web started from the image ID" test "$(admin "docker inspect -f '{{.Config.Image}}' $APP-web-1" | cut -c1-7)" = sha256:
 check "first rollout: dump skipped with a log line" admin "grep -q 'pre-deploy dump skipped' /opt/$APP/state/deploy.log"
 check "registry login kept in state/docker" admin "sudo test -f /opt/$APP/state/docker/config.json"
 
@@ -222,7 +239,22 @@ check "broken rollout fails" test "$rc" -ne 0
 check "reports the rollback" grep -q "rolled back to $SHA2" <<<"$OUT"
 check "last-known-good stays SHA2" test "$(lkg)" = "$SHA2"
 check "web runs SHA2 again and is healthy" \
-  test "$(admin "docker inspect -f '{{.Config.Image}} {{.State.Health.Status}}' $APP-web-1" | sed 's/.*://')" = "$SHA2 healthy"
+  test "$(running_tag) $(admin "docker inspect -f '{{.State.Health.Status}}' $APP-web-1")" = "$SHA2 healthy"
+
+say "compose policy"
+admin "sudo mkfifo -m 644 /opt/x.yml"
+# perl alarm: macOS has no timeout(1). A blocked read of the FIFO ends in SIGALRM, rc 142.
+rc=0; OUT=$(perl -e 'alarm 120; exec @ARGV' ssh -i "$DEPLOY_KEY" "deployer@$HOST" "deploy $SHA4" 2>&1) || rc=$?
+printf '%s\n' "$OUT" | tail -n 1
+check "include of a file outside the image refused" grep -q "compose of $SHA4 reads files from the host: include;.*production untouched" <<<"$OUT"
+check "include refused without opening the file (no timeout)" test "$rc" = 1
+check "include: SHA2 keeps running" test "$(lkg) $(running_tag)" = "$SHA2 $SHA2"
+admin "sudo rm /opt/x.yml"
+rc=0; OUT=$(deploy "deploy $SHA5" 2>&1) || rc=$?
+printf '%s\n' "$OUT" | tail -n 1
+check "image label routing a foreign host refused" \
+  grep -q "compose of $SHA5 refused by the server policy: web.labels:traefik.http.routers.$APP.rule;.*production untouched" <<<"$OUT"
+check "foreign host: SHA2 keeps running" test "$(lkg) $(running_tag)" = "$SHA2 $SHA2"
 
 say "refusals"
 for c in "ls" "deploy $SHA2; id" "deploy latest" "deploy  $SHA2" ""; do

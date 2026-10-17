@@ -140,15 +140,25 @@ What `deploy-app <app>` does on `ssh deployer@<host> "deploy <sha>"`:
   fallback `/opt/<app>/docker-compose.yml`) and gives the same bytes to every
   compose call, passes `IMAGE` and `IMAGE_TAG` in the environment, project
   name `<app>`;
-- renders that compose with `docker compose config --format json` and checks
-  it with `jq` before the dump and `up`: privileged, host or `container:`
+- before the first compose call, loads the raw compose with python3 and
+  PyYAML and refuses `include`, `extends.file`, `label_file` and `build`:
+  compose would read those files (another project's `.env` included)
+  while it parses;
+- renders that compose with `docker compose config --format json
+  --no-env-resolution` and checks it with `jq` before the dump and `up`:
+  `env_file` outside `/opt/<app>/`, `use_api_socket`, `provider`, privileged, host or `container:`
   namespaces, `cap_add`, `devices`, unconfined `security_opt`, binds that are
   not a direct child of `/opt/<app>/` or are a symlink (the Docker socket,
   deeper paths, `state/` included), foreign or external volumes and networks
   (except `proxy`; a name `<app>_x_*` while a project `<app>_x` exists is
   foreign too), `secrets`/`configs` files by the same rule stop the
   rollout with the findings named; after `compose pull` the tag must still
-  name the checked image ID, and `up` runs with `--pull never`; exceptions are lines in the
+  name the checked image ID; Traefik labels of each service (image labels
+  included) may name only `<app>`/`<app>-*` routers, services and
+  middlewares and route only `Host`s in `SITE_DOMAIN` and `ALLOWED_HOSTS`
+  of `.env`, joined with `&&` (no `||`, `!`, `HostRegexp`); `up` runs with
+  `--pull never --no-build` and `state/compose-pin.json`, every service
+  pinned to its checked image ID; exceptions are lines in the
   root-owned `/opt/<app>/compose-policy-allow`
   (references/security-checklist.md);
 - if the running stack has a `postgres` service: `pg_dump` of every
