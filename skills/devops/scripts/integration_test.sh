@@ -10,6 +10,7 @@
 # with the pre-deploy dump, a broken healthcheck rolled back to
 # last-known-good, refused commands, a concurrent rollout refused by the lock,
 # restore of the dump, check.sh, idempotent reruns of web-init and add-project,
+# add-project refusing names that collide through `_`,
 # auto-reboot at 04:00 and its removal on a rerun once a VPN unit shows up.
 # vpn-deploy on a fresh server is integration_vpn_test.sh.
 #
@@ -184,6 +185,16 @@ check "api: DEPLOY_HOST_KEY pins the server key" \
 check "api: variable REGISTRY = DEVOPS_REGISTRY" test "$(tail -n +2 "$W/secrets/REGISTRY")" = git.example.com
 check "api: no key left on disk" test "$(find "$W/tmp" -mindepth 1 | wc -l)" -eq "$before"
 check "api: asks for REGISTRY_TOKEN and .env" grep -qx 'WAIT 2' <<<"$OUT"
+
+say "add-project.sh: names that collide through _"
+# Volume x_data of demo and volume data of demo_x are both demo_x_data.
+rc=0; OUT=$(bash "$SKILL/scripts/add-project.sh" "$HOST" ${APP}_x 2>&1) || rc=$?
+check "${APP}_x refused while $APP exists" grep -q "project ${APP}_x collides with project $APP on" <<<"$OUT"
+check "${APP}_x: no directory created" admin "! test -e /opt/${APP}_x"
+admin "sudo install -d -m 755 /opt/apitest_v2 && sudo touch /opt/apitest_v2/.env"
+rc=0; OUT=$(bash "$SKILL/scripts/add-project.sh" "$HOST" apitest 2>&1) || rc=$?
+check "apitest refused while apitest_v2 exists" grep -q 'project apitest collides with project apitest_v2 on' <<<"$OUT"
+admin "sudo rm -rf /opt/apitest_v2"
 
 # --- rollouts -------------------------------------------------------------
 lkg() { admin "cat /opt/$APP/state/last-known-good"; }

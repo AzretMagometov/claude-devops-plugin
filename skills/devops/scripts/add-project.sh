@@ -59,6 +59,15 @@ STATE=$("${SSH[@]}" "sudo APP=$APP COMMENT=$COMMENT bash -s" <<'REMOTE'
 set -euo pipefail
 [ -x /usr/local/bin/deploy-app ] && id deployer >/dev/null 2>&1 || { echo "web=0"; exit 0; }
 echo "web=1"
+# compose names volumes and networks <app>_<name>: volume x_data of demo and
+# volume data of demo_x are both demo_x_data. A project (a directory with
+# .env) named <app>_*, or whose name + _ starts <app>, stops the run here.
+for d in /opt/*/; do
+  o=$(basename "$d")
+  [ "$o" != "$APP" ] && [ -f "$d.env" ] || continue
+  case $APP in "${o}_"*) echo "collide=$o"; exit 0 ;; esac
+  case $o in "${APP}_"*) echo "collide=$o"; exit 0 ;; esac
+done
 install -d -m 755 -o root -g root "/opt/$APP"
 install -d -m 755 -o deployer -g deployer "/opt/$APP/state"
 ENV=/opt/$APP/.env
@@ -77,6 +86,7 @@ REMOTE
 )
 fact() { sed -n "s/^$1=//p" <<<"$STATE"; }
 [[ $(fact web) == 1 ]] || die "no deploy-app or deployer on $HOST: run web-init $HOST first"
+[[ -z $(fact collide) ]] || die "project ${APP} collides with project $(fact collide) on ${HOST}: compose names volumes <project>_<name>, so volume x_data of demo is volume data of demo_x; pick another name"
 echo "✓ /opt/${APP} root 755, /opt/${APP}/state deployer 755"
 
 if [[ $(fact env) == 1 ]]; then

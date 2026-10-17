@@ -59,12 +59,14 @@ chmod +x "$T/bin/"*
 state() { printf '%s\n' web=1 "$@" "host_key=ssh-ed25519 AAAAhostkey" > "$T/state"; }
 reset() { rm -f "$T"/*.log "$T"/gh-DEPLOY_* "$T"/api-*; }
 
-# run <env...>: add-project.sh demo-host demo with the shims; sets OUT and RC.
+# run <env...>: add-project.sh demo-host $NAME (default demo) with the
+# shims; sets OUT and RC.
+NAME=demo
 run() {
   RC=0
   OUT=$(env -u FORGEJO_API_TOKEN -u GITHUB_REPO PATH="$T/bin:$PATH" TMPDIR="$T/tmp" SHIM="$T" \
     DEVOPS_CONFIG=/dev/null DEVOPS_ADMIN=ops DEVOPS_REGISTRY=git.example.com DEVOPS_REGISTRY_USER=Ops \
-    "$@" bash "$SKILL/scripts/add-project.sh" demo-host demo 2>&1 < /dev/null) || RC=$?
+    "$@" bash "$SKILL/scripts/add-project.sh" demo-host "$NAME" 2>&1 < /dev/null) || RC=$?
 }
 check() {
   local name=$1; shift
@@ -146,6 +148,17 @@ reset; state "${ALL[@]}"
 run DEVOPS_FORGE=gitlab
 check "unknown forge: exit 1" test "$RC" = 1
 check "unknown forge: names DEVOPS_FORGE" has "DEVOPS_FORGE=gitlab: expected forgejo or github"
+
+# --- name collision -------------------------------------------------------
+# compose names volumes and networks <app>_<name>: volume x_data of demo and
+# volume data of demo_x are both demo_x_data. The server reports a project
+# whose name is <app>_* or a prefix of <app>_ (integration_test.sh runs the
+# server side); the run stops before the key is installed.
+reset; state collide=demo
+NAME=demo_x run
+check "collision: exit 1" test "$RC" = 1
+check "collision: names both projects" has 'project demo_x collides with project demo on demo-host'
+check "collision: no key installed" test ! -e "$T/ak.log"
 
 echo
 if [[ $FAILED -ne 0 ]]; then echo "$FAILED failed"; exit 1; fi

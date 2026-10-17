@@ -33,6 +33,16 @@
 # /opt/<app>/docker-compose.yml is the fallback for images without it.
 # Compose gets IMAGE and IMAGE_TAG in the environment, which wins over .env.
 #
+# One image, one compose. The CI token can push to the registry, so a tag
+# may name another image a minute later. After `docker pull` the tag is
+# resolved to its image ID once; the compose file is read once from that ID
+# (`docker run` of an ID never pulls) and kept in memory, and every compose
+# call of the run gets those bytes. After `compose pull`, which pulls the app
+# tag again with the rest of the stack, the tag must still name that ID, and
+# `up --pull never` starts what is on disk: a tag re-pushed in between stops
+# the run before production changes. The rollback pulls the previous tag
+# explicitly (the weekly prune may have removed it) and goes the same way.
+#
 # Compose policy. deployer is in the docker group and the compose file comes
 # from whoever can push to main, so the file decides what runs as root on a
 # server shared with other projects. Before any change to production, and
@@ -46,25 +56,39 @@
 #                                        not empty
 #   <svc>.security_opt                   an *unconfined* apparmor or seccomp
 #   <svc>.volumes_from:container:<name>  volumes of a container outside the stack
-#   <svc>.volumes:<source>               a bind mount not strictly below
-#                                        /opt/<app>/ (the docker socket too),
-#                                        or of compose-policy-allow itself:
-#                                        container root writes as host root
+#   <svc>.volumes:<source>               a bind mount whose source is not a
+#                                        direct child of /opt/<app>/ (the
+#                                        docker socket too, anything deeper,
+#                                        `..`), is compose-policy-allow or
+#                                        state/, or is a symlink on disk
 #   volumes.<name>.external|driver|driver_opts|name
 #                                        external, a driver other than local,
 #                                        driver_opts (a bind in disguise), or
-#                                        a name without the <app>_ prefix
+#                                        a name without the <app>_ prefix or
+#                                        with the <other>_ prefix of a project
+#                                        /opt/<other> named <app>_*
 #   networks.<name>.external|name        external other than proxy, or a name
-#                                        without the <app>_ prefix
-#   secrets|configs.<name>.file          a file outside /opt/<app>/
-# Named volumes, tmpfs and binds below /opt/<app>/ pass. Any finding stops
-# the run. Root grants an exception in /opt/<app>/compose-policy-allow: one
-# token per line, exactly as the refusal prints it; `#` starts a comment.
+#                                        as for volumes
+#   secrets|configs.<name>.file          a file by the same rule as a bind
+# Named volumes, tmpfs and binds of direct children of /opt/<app>/ pass. Why
+# direct children: container root writes as host root, so below a bound
+# directory a container can plant a symlink, and a later rollout binding that
+# path would mount whatever it points to on the host. /opt/<app> itself is
+# root:root 755 and never bound, so no container can create or swap an entry
+# in it: a direct child that is not a symlink when checked stays so until
+# `up`. state/ is deployer's (last-known-good, registry login), not the
+# stack's. Volume and network names: compose names them <app>_<name>, and
+# with a project demo_x on the server, volume x_data of demo is demo_x_data,
+# the volume data of demo_x; such a name is a finding too. Any finding stops
+# the run. Root grants
+# an exception in /opt/<app>/compose-policy-allow: one token per line,
+# exactly as the refusal prints it; `#` starts a comment.
 #   # the vpn sidecar manages routes
 #   vpn.cap_add
 #   app.volumes:/srv/shared
-# The file must be a regular file of root, writable by root alone; otherwise
-# the run stops: deployer must not grant itself exceptions.
+# An exception for a deeper bind brings the symlink case back for that path:
+# root's call. The file must be a regular file of root, writable by root
+# alone; otherwise the run stops: deployer must not grant itself exceptions.
 set -euo pipefail
 
 HEALTH_TIMEOUT=180
@@ -75,10 +99,15 @@ COMPOSE_IN_IMAGE=/app/docker-compose.yml
 # top-level names already prefixed with the project. Prints one token per
 # finding.
 # shellcheck disable=SC2016 # jq variables
-POLICY='
+POLICY_DEFS='
   def ns_escape: type == "string" and (. == "host" or startswith("container:"));
-  def outside: (startswith($dir + "/") | not) or . == $allow;
-  def foreign: startswith($app + "_") | not;
+  def child: ($dir + "/") as $p | select(startswith($p)) | .[($p | length):];
+  def outside: [child | select(. != "" and . != "." and . != ".." and . != "state"
+    and . != "compose-policy-allow" and (contains("/") | not))] | length == 0;
+  def foreign: (startswith($app + "_") | not) or (. as $n | any($longer[]; . as $o | $n | startswith($o + "_")));
+'
+# shellcheck disable=SC2016 # jq variables
+POLICY=$POLICY_DEFS'
   (.services // {} | to_entries[] | .key as $svc | .value | (
       (select(.privileged == true) | "privileged"),
       (("network_mode", "pid", "ipc", "uts", "cgroup", "userns_mode") as $k
@@ -102,6 +131,16 @@ POLICY='
   (("secrets", "configs") as $sec | .[$sec] // {} | to_entries[]
     | select(.value.file != null and (.value.file | outside))
     | "\($sec).\(.key).file")
+'
+# The sources that pass POLICY as paths, "<token>\t<path>": a symlink among
+# them is a finding too, which only the file system knows.
+# shellcheck disable=SC2016 # jq variables
+BIND_SOURCES=$POLICY_DEFS'
+  (.services // {} | to_entries[] | .key as $svc | .value.volumes[]?
+    | select(.type == "bind" and (.source | outside | not)) | "\($svc).volumes:\(.source)\t\(.source)"),
+  (("secrets", "configs") as $sec | .[$sec] // {} | to_entries[]
+    | select(.value.file != null and (.value.file | outside | not))
+    | "\($sec).\(.key).file\t\(.value.file)")
 '
 
 log() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -184,39 +223,57 @@ printf '%s' "$TOKEN" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-s
 # A tag missing from the registry shows here, before any container changes.
 docker pull --quiet "${IMAGE}:${TAG}" > /dev/null || die "image ${IMAGE}:${TAG} did not download; production untouched"
 
-compose_file() {
-  docker run --rm --entrypoint cat "${IMAGE}:$1" "$COMPOSE_IN_IMAGE" 2>/dev/null || {
-    log "image $1 has no ${COMPOSE_IN_IMAGE}, using ${PROJECT_DIR}/docker-compose.yml"
+# image_id <tag>: the local image the tag names now.
+image_id() { docker image inspect --format '{{.Id}}' "${IMAGE}:$1" 2>/dev/null; }
+
+# compose_of <image id> <tag>: the compose file inside that image, read by ID.
+compose_of() {
+  docker run --rm --pull never --entrypoint cat "$1" "$COMPOSE_IN_IMAGE" 2>/dev/null || {
+    log "image $2 has no ${COMPOSE_IN_IMAGE}, using ${PROJECT_DIR}/docker-compose.yml"
     cat "$PROJECT_DIR/docker-compose.yml"
   }
 }
 
-# The compose file arrives on stdin, so the project name is given explicitly:
-# volumes are bound to <app>_*.
+# compose <tag> <compose file text> <args...>. The compose file arrives on
+# stdin, so the project name is given explicitly: volumes are bound to <app>_*.
 compose() {
-  compose_file "$1" | IMAGE="$IMAGE" IMAGE_TAG="$1" docker compose \
+  IMAGE="$IMAGE" IMAGE_TAG="$1" docker compose \
     --project-name "$APP" \
     --project-directory "$PROJECT_DIR" \
     --env-file "$PROJECT_DIR/.env" \
-    -f - "${@:2}"
+    -f - "${@:3}" <<< "$2"
 }
 
-# policy_findings <tag>: the findings of the stack of that tag not granted by
-# the allow file, comma-separated; fails when compose cannot render it.
+# policy_findings <tag> <compose file text>: the findings of that stack not
+# granted by the allow file, comma-separated; fails when compose cannot
+# render it.
 policy_findings() {
   local json
-  json=$(compose "$1" config --format json) && [[ -n $json ]] || return 1
-  jq -r --arg app "$APP" --arg dir "$PROJECT_DIR" --arg allow "$ALLOW_FILE" "$POLICY" <<< "$json" \
-    | { grep -Fxv -f <(allowed_tokens) || true; } | paste -sd, - | sed 's/,/, /g'
+  json=$(compose "$1" "$2" config --format json) && [[ -n $json ]] || return 1
+  # The projects named <app>_*: their volumes and networks are <app>_* too.
+  local longer
+  longer=$(find /opt -mindepth 1 -maxdepth 1 -type d -name "${APP}_*" -printf '%f\n' | jq -Rnc '[inputs]')
+  local jq_args=(-r --arg app "$APP" --arg dir "$PROJECT_DIR" --argjson longer "$longer")
+  {
+    jq "${jq_args[@]}" "$POLICY" <<< "$json"
+    jq "${jq_args[@]}" "$BIND_SOURCES" <<< "$json" | while IFS=$'\t' read -r token src; do
+      [[ ! -L $src ]] || printf '%s\n' "$token"
+    done
+  } | { grep -Fxv -f <(allowed_tokens) || true; } | paste -sd, - | sed 's/,/, /g'
 }
+
+TAG_ID=$(image_id "$TAG") || die "image ${IMAGE}:${TAG} is not on disk after the pull; production untouched"
+TAG_COMPOSE=$(compose_of "$TAG_ID" "$TAG") || die "no compose file for ${TAG}; production untouched"
 
 # Before the stack images are pulled, the dump and up: a refused stack
 # changes nothing.
-FINDINGS=$(policy_findings "$TAG") || die "compose of ${TAG} does not render; production untouched"
+FINDINGS=$(policy_findings "$TAG" "$TAG_COMPOSE") || die "compose of ${TAG} does not render; production untouched"
 [[ -z $FINDINGS ]] \
   || die "compose of ${TAG} refused by the server policy: ${FINDINGS}; root may grant exceptions in ${ALLOW_FILE}; production untouched"
 
-compose "$TAG" pull --quiet || die "stack images for ${TAG} did not download; production untouched"
+compose "$TAG" "$TAG_COMPOSE" pull --quiet || die "stack images for ${TAG} did not download; production untouched"
+[[ $(image_id "$TAG") == "$TAG_ID" ]] \
+  || die "image ${IMAGE}:${TAG} changed in the registry during the rollout (was ${TAG_ID}); production untouched"
 
 # --- database dump before migrations --------------------------------------
 # One rolling file, overwritten by every rollout: the state just before the
@@ -255,7 +312,7 @@ fi
 # `up --wait` starts services in dependency order: the one-shot migrate
 # finishes before the app starts. Health is the container healthcheck, not a
 # request through Traefik, which answers 404 for an unhealthy container.
-if compose "$TAG" up -d --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
+if compose "$TAG" "$TAG_COMPOSE" up -d --pull never --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
   echo "$TAG" > "$STATE_FILE"
   log "rollout succeeded, ${TAG} recorded as last known good"
   docker image prune -f > /dev/null
@@ -268,7 +325,7 @@ fi
 # (references/migration-patterns.md). pre-deploy.sql.gz is there for the case
 # when they are not.
 log "stack not healthy in ${HEALTH_TIMEOUT}s, rolling back to ${PREVIOUS:-<nothing>}"
-compose "$TAG" logs --tail 40 --no-color >&2 || true
+compose "$TAG" "$TAG_COMPOSE" logs --tail 40 --no-color >&2 || true
 
 [[ -n $PREVIOUS ]] \
   || die "no previous tag, nothing to roll back to: needs a human"
@@ -277,12 +334,22 @@ compose "$TAG" logs --tail 40 --no-color >&2 || true
 # rollout keeps it down.
 [[ $PREVIOUS =~ ^[0-9a-f]{40}$ ]] \
   || die "last-known-good holds \"${PREVIOUS}\", not a tag: not rolling back, needs a human"
-FINDINGS=$(policy_findings "$PREVIOUS") \
+docker pull --quiet "${IMAGE}:${PREVIOUS}" > /dev/null \
+  || die "image ${IMAGE}:${PREVIOUS} did not download: not rolling back, needs a human"
+PREV_ID=$(image_id "$PREVIOUS") \
+  || die "image ${IMAGE}:${PREVIOUS} is not on disk after the pull: not rolling back, needs a human"
+PREV_COMPOSE=$(compose_of "$PREV_ID" "$PREVIOUS") \
+  || die "no compose file for ${PREVIOUS}: not rolling back, needs a human"
+FINDINGS=$(policy_findings "$PREVIOUS" "$PREV_COMPOSE") \
   || die "compose of the previous tag ${PREVIOUS} does not render: not rolling back, needs a human"
 [[ -z $FINDINGS ]] \
   || die "previous tag ${PREVIOUS} refused by the server policy: ${FINDINGS}; not rolling back, needs a human"
+compose "$PREVIOUS" "$PREV_COMPOSE" pull --quiet \
+  || die "stack images for ${PREVIOUS} did not download: not rolling back, needs a human"
+[[ $(image_id "$PREVIOUS") == "$PREV_ID" ]] \
+  || die "image ${IMAGE}:${PREVIOUS} changed in the registry during the rollback (was ${PREV_ID}): not rolling back, needs a human"
 
-if compose "$PREVIOUS" up -d --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
+if compose "$PREVIOUS" "$PREV_COMPOSE" up -d --pull never --remove-orphans --wait --wait-timeout "$HEALTH_TIMEOUT"; then
   die "rollout of ${TAG} failed, ${APP} rolled back to ${PREVIOUS}"
 fi
 die "rollout of ${TAG} failed AND the rollback to ${PREVIOUS} did not come up: needs a human"

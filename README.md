@@ -198,10 +198,17 @@ them against a server that already holds data.
 - `deploy-app` checks the compose file of the tag before it changes
   production and before a rollback. It refuses privileged containers, host
   namespaces, added capabilities and devices, unconfined seccomp or
-  AppArmor, the Docker socket, bind mounts outside `/opt/<app>/`, and
-  volumes or networks of other projects. Root grants exceptions in
-  `/opt/<app>/compose-policy-allow`
+  AppArmor, the Docker socket, bind mounts other than a direct child of
+  `/opt/<app>/` that is not a symlink, and volumes or networks of other
+  projects. Root grants exceptions in `/opt/<app>/compose-policy-allow`
   ([security-checklist.md](skills/devops/references/security-checklist.md)).
+- `deploy-app` resolves the tag to an image ID once, reads the compose file
+  from that ID once, and starts the stack with `--pull never`. A tag pushed
+  again to the registry during the rollout stops the run.
+- Compose names volumes and networks `<app>_<name>`, so volume `x_data` of
+  `demo` is volume `data` of `demo_x`. `add-project.sh` refuses a project
+  whose name extends another one on the server with `_`, or the reverse, and
+  `deploy-app` refuses such names while the longer project exists.
 
 ### Trust model
 
@@ -211,10 +218,8 @@ compose policy of `deploy-app` stops a pushed compose file from reaching the
 host or another project through the keys above. The policy does not limit
 the application code. That code runs with its own secrets and its own
 database, and it reaches whatever its network allows. The policy also does
-not cover a kernel or Docker escape. It checks bind sources as paths and
-does not follow symlinks, so a container that writes to a bind below
-`/opt/<app>/` can plant a symlink there for a later rollout. Keep projects with different trust levels on separate VPS
-when you need strong isolation.
+not cover a kernel or Docker escape. Keep projects with different trust
+levels on separate VPS when you need strong isolation.
 - `add-project.sh` deletes the local copy of the private deploy key after it
   uploads the key as a repository secret.
 - `vpn-deploy` writes client links to `~/vpn-configs/<IP>` on your machine

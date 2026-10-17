@@ -15,7 +15,7 @@ else. It holds no secrets, so it may be committed.
 | Key | Value |
 |-----|-------|
 | `server` | IP or `~/.ssh/config` alias of the server. The user is always `DEVOPS_ADMIN` from `~/.config/devops/env`. |
-| `app` | Compose project name = repository name = `COMPOSE_PROJECT_NAME`. Unique per server. Gives `/opt/<app>`, the key line `deploy-app <app>`, the image `<DEVOPS_REGISTRY>/<DEVOPS_REGISTRY_USER>/<app>` (on GitHub `ghcr.io/<owner>/<app>`). |
+| `app` | Compose project name = repository name = `COMPOSE_PROJECT_NAME`. Unique per server, and not `<other>_*` for another project on it, nor a prefix of one (`demo` next to `demo_x`): compose names volumes `<app>_<name>`, so volume `x_data` of `demo` is volume `data` of `demo_x`. `add-project.sh` refuses such a pair. Gives `/opt/<app>`, the key line `deploy-app <app>`, the image `<DEVOPS_REGISTRY>/<DEVOPS_REGISTRY_USER>/<app>` (on GitHub `ghcr.io/<owner>/<app>`). |
 | `domain` | Host the server Traefik routes to the project. |
 | `repo` | Repository URL on Forgejo or GitHub. |
 

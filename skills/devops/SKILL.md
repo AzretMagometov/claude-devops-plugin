@@ -134,16 +134,21 @@ What `deploy-app <app>` does on `ssh deployer@<host> "deploy <sha>"`:
   project fails at once;
 - reads `IMAGE` (required, `<registry>/<owner>/<app>`), `REGISTRY_TOKEN`
   (required), `REGISTRY_USER` (default the `<owner>` of `IMAGE`) from `.env`;
-  `add-project.sh` lists a missing `IMAGE` among the open items; logs in to the registry of `IMAGE`, pulls the tag;
-- takes the compose file from the image (`/app/docker-compose.yml`,
-  fallback `/opt/<app>/docker-compose.yml`), passes `IMAGE` and `IMAGE_TAG`
-  in the environment, project name `<app>`;
+  `add-project.sh` lists a missing `IMAGE` among the open items; logs in to the registry of `IMAGE`, pulls the tag
+  and resolves it to an image ID;
+- reads the compose file once from that image ID (`/app/docker-compose.yml`,
+  fallback `/opt/<app>/docker-compose.yml`) and gives the same bytes to every
+  compose call, passes `IMAGE` and `IMAGE_TAG` in the environment, project
+  name `<app>`;
 - renders that compose with `docker compose config --format json` and checks
   it with `jq` before the dump and `up`: privileged, host or `container:`
-  namespaces, `cap_add`, `devices`, unconfined `security_opt`, binds outside
-  `/opt/<app>/` (the Docker socket included), foreign or external volumes and
-  networks (except `proxy`), `secrets`/`configs` files outside `/opt/<app>/`
-  stop the rollout with the findings named; exceptions are lines in the
+  namespaces, `cap_add`, `devices`, unconfined `security_opt`, binds that are
+  not a direct child of `/opt/<app>/` or are a symlink (the Docker socket,
+  deeper paths, `state/` included), foreign or external volumes and networks
+  (except `proxy`; a name `<app>_x_*` while a project `<app>_x` exists is
+  foreign too), `secrets`/`configs` files by the same rule stop the
+  rollout with the findings named; after `compose pull` the tag must still
+  name the checked image ID, and `up` runs with `--pull never`; exceptions are lines in the
   root-owned `/opt/<app>/compose-policy-allow`
   (references/security-checklist.md);
 - if the running stack has a `postgres` service: `pg_dump` of every
@@ -153,8 +158,8 @@ What `deploy-app <app>` does on `ssh deployer@<host> "deploy <sha>"`:
   line;
 - `up -d --remove-orphans --wait`; healthy → the tag goes to
   `state/last-known-good`, `docker image prune`; not healthy → logs and
-  rollback to `last-known-good`, which passes the same policy first or the
-  run stops with "needs a human";
+  rollback to `last-known-good`, pulled explicitly and checked the same way
+  first, or the run stops with "needs a human";
 - copies its output to `state/deploy.log`.
 
 Tests: `scripts/deploy-app_test.sh` (parsing, lock, pre-deploy dump,

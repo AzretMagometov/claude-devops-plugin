@@ -7,8 +7,13 @@
 # `docker exec` runs the dump script here with fake psql and pg_dump, and
 # `compose up` fails, so the run ends at the rollback; a tag listed in
 # FAKE_UP_TAGS comes up. `compose config` prints $CONFIGS/<tag>.json, else
-# $CONFIGS/default.json, and the real jq checks it. The full rollout is
-# covered by integration_test.sh.
+# $CONFIGS/default.json, and the real jq checks it. `image inspect` answers
+# the ID id-<tag>, and id-repushed once `compose pull` of the tag in
+# FAKE_REPUSH ran: the registry got a new image under the same tag. `docker run` of an
+# image ID prints the compose file "compose of <ID>" when FAKE_COMPOSE is
+# set and fails otherwise (no compose in the image); every compose call
+# appends the compose file it got on stdin to $COMPOSE_INPUTS. The full
+# rollout is covered by integration_test.sh.
 #
 # deploy-app writes to /opt/<app> and needs flock(1) from util-linux and jq,
 # so on a machine without them the tests re-run themselves in a debian
@@ -29,19 +34,25 @@ BIN="$TMP/bin"
 mkdir -p "$BIN"
 cat > "$BIN/docker" <<'EOF'
 #!/usr/bin/env bash
-cat > /dev/null
+stdin=$(cat)
 echo "docker $*${IMAGE_TAG:+ [$IMAGE_TAG]}" >> "$DOCKER_CALLS"
 [[ ${FAKE_DOCKER:-} == up ]] || exit 1
 case "$1" in
   ps) echo pg0 ;;
   exec) shift 2; POSTGRES_USER=u POSTGRES_DB=app exec "$@" ;;
+  image)
+    ref=${*: -1}
+    [[ -e $DOCKER_CALLS.repushed ]] && echo sha256:id-repushed || echo "sha256:id-${ref##*:}" ;;
   compose)
+    printf '%s\n' "$stdin" >> "$COMPOSE_INPUTS"
     if [[ " $* " == *" config "* ]]; then
       cat "$CONFIGS/$IMAGE_TAG.json" 2>/dev/null || cat "$CONFIGS/default.json"
+    elif [[ " $* " == *" pull "* ]]; then
+      [[ ${FAKE_REPUSH:-} != "$IMAGE_TAG" ]] || touch "$DOCKER_CALLS.repushed"
     elif [[ " $* " == *" up "* ]]; then
       [[ " ${FAKE_UP_TAGS:-} " == *" $IMAGE_TAG "* ]]
     fi ;;
-  run) exit 1 ;;
+  run) [[ -n ${FAKE_COMPOSE:-} ]] && echo "compose of ${*: -2:1}" ;;
 esac
 EOF
 # The cluster of the fake postgres: databases app and glitchtip. pg_dump
@@ -58,7 +69,7 @@ echo "pg_dump $*" >> "$DOCKER_CALLS"
 echo "-- dump of ${*: -1}"
 EOF
 chmod +x "$BIN/docker" "$BIN/psql" "$BIN/pg_dump"
-export DOCKER_CALLS="$TMP/docker-calls"
+export DOCKER_CALLS="$TMP/docker-calls" COMPOSE_INPUTS="$TMP/compose-inputs"
 export CONFIGS="$TMP/configs"
 mkdir -p "$CONFIGS"
 FAILED=0
@@ -86,7 +97,7 @@ project() {
   printf '%s\n' "$2" > "/opt/$1/.env"
   : > "/opt/$1/docker-compose.yml"
 }
-trap 'rm -rf "$TMP" /opt/demo /opt/other' EXIT
+trap 'rm -rf "$TMP" /opt/demo /opt/other /opt/demo_x' EXIT
 
 # case_ <name> <expected exit code> <expected output regex> <app args...>
 # SSH_ORIGINAL_COMMAND comes from the variable CMD.
@@ -94,6 +105,8 @@ case_() {
   local name=$1 want_rc=$2 want=$3 out rc=0
   shift 3
   : > "$DOCKER_CALLS"
+  : > "$COMPOSE_INPUTS"
+  rm -f "$DOCKER_CALLS.repushed"
   out=$(SSH_ORIGINAL_COMMAND="$CMD" PATH="$BIN:$PATH" bash "$DEPLOY_APP" "$@" 2>&1 < /dev/null) || rc=$?
   if [[ $rc -eq $want_rc && $out =~ $want ]]; then
     echo "ok   $name"
@@ -257,19 +270,56 @@ gate_refuses "config file outside /opt/demo" 'configs\.c\.file'
 refused_app '{"privileged": true, "cap_add": ["NET_ADMIN"]}'
 gate_refuses "every violation listed" 'app\.privileged, app\.cap_add'
 
+# A bind is a direct child of /opt/demo: nothing deeper, no `..`. Below a
+# direct child a container of the stack writes as host root and can plant a
+# symlink that a later rollout would mount; /opt/demo itself is root's 755.
+bind_app() { refused_app "{\"volumes\": [{\"type\": \"bind\", \"source\": \"$1\", \"target\": \"/x\", \"bind\": {}}]}"; }
+bind_app /opt/demo/uploads/avatars;   gate_refuses "bind deeper than a direct child" 'app\.volumes:/opt/demo/uploads/avatars'
+bind_app /opt/demo/../etc;            gate_refuses "bind with .." 'app\.volumes:/opt/demo/\.\./etc'
+bind_app /opt/demo/..;                gate_refuses "bind of /opt/demo/.." 'app\.volumes:/opt/demo/\.\.'
+bind_app /opt/demo/.;                 gate_refuses "bind of /opt/demo/." 'app\.volumes:/opt/demo/\.'
+bind_app /opt/demo/;                  gate_refuses "bind of /opt/demo/" 'app\.volumes:/opt/demo/'
+# state/ is deployer's: last-known-good, the registry login, the lock.
+bind_app /opt/demo/state;             gate_refuses "bind of state/" 'app\.volumes:/opt/demo/state'
+# A direct child that is a symlink on disk mounts its target.
+ln -s /etc /opt/demo/link
+bind_app /opt/demo/link;              gate_refuses "bind of a symlink" 'app\.volumes:/opt/demo/link'
+config "$SHA" "$CLEAN_APP" '{"secrets": {"s": {"name": "demo_s", "file": "/opt/demo/link"}}}'
+gate_refuses "secret file that is a symlink" 'secrets\.s\.file'
+rm /opt/demo/link
+config "$SHA" "$CLEAN_APP" '{"secrets": {"s": {"name": "demo_s", "file": "/opt/demo/keys/s.txt"}}}'
+gate_refuses "secret file deeper than a direct child" 'secrets\.s\.file'
+config "$SHA" "$CLEAN_APP" '{"configs": {"c": {"name": "demo_c", "file": "/opt/demo/../other/.env"}}}'
+gate_refuses "config file with .." 'configs\.c\.file'
+
+# Compose names volumes and networks <app>_<name>: with project demo_x on
+# the server, volume x_data of demo is demo_x_data, the name of volume data
+# of demo_x.
+mkdir /opt/demo_x
+config "$SHA" "$CLEAN_APP" '{"volumes": {"x_data": {"name": "demo_x_data"}}}'
+gate_refuses "volume named into project demo_x" 'volumes\.x_data\.name'
+config "$SHA" "$CLEAN_APP" '{"networks": {"x_backend": {"name": "demo_x_backend"}}}'
+gate_refuses "network named into project demo_x" 'networks\.x_backend\.name'
+rmdir /opt/demo_x
+
 : > "$CONFIGS/$SHA.json"
 case_ "policy: a compose that does not render" 1 'compose of [0-9a-f]+ does not render; production untouched' demo
 
-# What stays allowed: binds below /opt/demo, named volumes of the project,
-# its own networks and the shared proxy, secrets from /opt/demo.
+# What stays allowed: binds of direct children of /opt/demo (a real
+# directory too), named volumes of the project, its own networks and the
+# shared proxy, secrets from /opt/demo. Volume x_data of demo is demo_x_data,
+# fine while no project demo_x exists.
+mkdir /opt/demo/media
 config "$SHA" "$(jq -c '. + {"volumes": [{"type": "bind", "source": "/opt/demo/uploads", "target": "/u", "bind": {}},
+  {"type": "bind", "source": "/opt/demo/media", "target": "/md", "bind": {}},
   {"type": "volume", "source": "media", "target": "/m", "volume": {}}, {"type": "tmpfs", "target": "/t"}]}' <<<"$CLEAN_APP")" \
-  '{"volumes": {"media": {"name": "demo_media", "driver": "local"}}, "networks": {"backend": {"name": "demo_backend"}},
+  '{"volumes": {"media": {"name": "demo_media", "driver": "local"}, "x_data": {"name": "demo_x_data"}}, "networks": {"backend": {"name": "demo_backend"}},
     "secrets": {"s": {"name": "demo_s", "file": "/opt/demo/secret.txt"}}}'
 export FAKE_UP_TAGS=$SHA
 case_ "policy: a clean compose deploys" 0 'rollout succeeded' demo
 check "clean compose recorded as last known good" test "$(cat /opt/demo/state/last-known-good)" = "$SHA"
 unset FAKE_UP_TAGS
+rmdir /opt/demo/media
 rm "$CONFIGS/$SHA.json"
 
 # --- exceptions -----------------------------------------------------------
@@ -313,6 +363,45 @@ check "dangerous previous tag never comes up" test -z "$(grep " up .*\[$PREV\]" 
 echo "not-a-tag" > /opt/demo/state/last-known-good
 case_ "last-known-good that is not a tag: no rollback" 1 'needs a human' demo
 check "invalid previous tag never comes up" test "$(grep -c ' up ' "$DOCKER_CALLS")" = 1
+
+# --- one image, one compose -----------------------------------------------
+# The compose that passed the policy is the one compose starts, and the app
+# image started is the one it came from: the tag resolves to an image ID
+# once, the compose is read once from that ID, and `up` never pulls. A tag
+# re-pushed in the registry during `compose pull` (the CI token writes
+# there) stops the run before `up`.
+APPREF=git.example.com/ops/demo
+rm -f /opt/demo/state/last-known-good "$CONFIGS/$PREV.json"
+export FAKE_COMPOSE=1
+case_ "compose from the image: dump, up fails, nothing to roll back to" 1 'no previous tag' demo
+check "compose read from the image ID, never from the tag" \
+  grep -qx "docker run --rm --pull never --entrypoint cat sha256:id-$SHA /app/docker-compose.yml" "$DOCKER_CALLS"
+check "compose read once" test "$(grep -c '^docker run ' "$DOCKER_CALLS")" = 1
+check "every compose call got the compose of that ID" \
+  test "$(sort -u "$COMPOSE_INPUTS")" = "compose of sha256:id-$SHA"
+check "up never pulls" test -z "$(grep ' up ' "$DOCKER_CALLS" | grep -v -- ' --pull never ')"
+
+export FAKE_REPUSH=$SHA
+case_ "tag re-pushed during compose pull: refused" 1 "${APPREF}:${SHA} changed in the registry during the rollout.*production untouched" demo
+check "re-pushed tag: no dump, no up" test -z "$(grep -E ' up |^pg_dump' "$DOCKER_CALLS")"
+
+# Rollback: PREVIOUS is pulled explicitly (the weekly prune may have removed
+# it), its compose read once from its ID and checked, and a re-push of
+# PREVIOUS during the pull keeps it down.
+echo "$PREV" > /opt/demo/state/last-known-good
+unset FAKE_REPUSH
+export FAKE_UP_TAGS=$PREV
+case_ "rollback from the image of PREVIOUS" 1 "rolled back to $PREV" demo
+check "rollback pulls PREVIOUS" grep -qx "docker pull --quiet ${APPREF}:${PREV}" "$DOCKER_CALLS"
+check "rollback reads the compose of the PREVIOUS ID" \
+  grep -qx "docker run --rm --pull never --entrypoint cat sha256:id-$PREV /app/docker-compose.yml" "$DOCKER_CALLS"
+check "rollback compose calls got the compose of the PREVIOUS ID" \
+  test "$(grep -c "compose of sha256:id-$PREV" "$COMPOSE_INPUTS")" -ge 3
+check "rollback up never pulls" grep -q " up .*--pull never.*\[$PREV\]" "$DOCKER_CALLS"
+export FAKE_REPUSH=$PREV
+case_ "PREVIOUS re-pushed during its compose pull: no rollback" 1 "${APPREF}:${PREV} changed in the registry.*needs a human" demo
+check "re-pushed PREVIOUS never comes up" test -z "$(grep " up .*\[$PREV\]" "$DOCKER_CALLS")"
+unset FAKE_COMPOSE FAKE_REPUSH
 unset FAKE_DOCKER FAKE_UP_TAGS
 
 echo
