@@ -174,7 +174,7 @@ fi
 # swap 2G only if there is no swap yet; it goes to fstab after a successful swapon
 SWAP="swap: already present"
 if [ -z "$(swapon --show --noheadings)" ]; then
-  [ -f /swapfile ] || { fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap -q /swapfile; }
+  [ -f /swapfile ] || { fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null; }
   if swapon /swapfile; then
     grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
     SWAP="swap: 2G /swapfile"
