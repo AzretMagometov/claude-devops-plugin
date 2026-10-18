@@ -145,7 +145,8 @@ Rules the template encodes, keep them when adapting:
 - No `logging:`: services inherit the journald driver of the daemon (web-init),
   so logs survive the container recreation on every deploy. They are kept
   30 days / 2G; read them with `docker logs <name>` or
-  `journalctl CONTAINER_NAME=<name>`.
+  `journalctl CONTAINER_NAME=<name>` (web-init puts the admin in
+  `systemd-journal`; takes effect on the next login).
 - Variables without a working default are `${NAME:?}`.
 - Migrations run in the one-shot `migrate` service before `app` starts
   (`migration-patterns.md`).

@@ -111,8 +111,11 @@ if [ "$OLD" != "$NEW" ]; then
   CHANGED+=("daemon.json")
 fi
 
-# --- 3. docker group for the admin ---
-id -nG "$ADMIN" | grep -qw docker || { usermod -aG docker "$ADMIN"; CHANGED+=("$ADMIN→docker"); }
+# --- 3. docker and systemd-journal groups for the admin ---
+# container logs are in journald; without the group journalctl shows the admin nothing
+for g in docker systemd-journal; do
+  id -nG "$ADMIN" | grep -qw "$g" || { usermod -aG "$g" "$ADMIN"; CHANGED+=("$ADMIN→$g"); }
+done
 
 # --- 4. shared network proxy ---
 docker network inspect proxy >/dev/null 2>&1 || { docker network create proxy >/dev/null; CHANGED+=("network proxy"); }
