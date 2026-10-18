@@ -11,6 +11,10 @@
 #            files land in the working directory without the top directory, a
 #            rejected token fails the step, a member that escapes the
 #            directory fails the step and writes nothing outside
+#   build    the `build` job bounds the runner disk: one shared builder `ci`
+#            with a GC limit, no registry cache, an always-run step removes
+#            the loaded image; the job image carries the label that the
+#            runner-host prune skips
 #
 #   bash ci-template_test.sh
 set -euo pipefail
@@ -45,10 +49,26 @@ check "Dockerfile base is the application base python:3.12-slim-bookworm" \
 # --- offline -----------------------------------------------------------------
 STEPS=$(grep -v '^[[:space:]]*#' <<<"$JOB")
 no_match() { ! grep -qE "$1" <<<"$STEPS"; }
+no_match_in() { ! grep -qE "$2" <<<"$1"; }
 check "no apt-get in the test job" no_match 'apt-get'
 check "no pip install in the test job" no_match 'pip install'
 check "no git in the test job" no_match '(^|[[:space:]])git '
 check "uv sync --frozen stays" grep -q 'uv sync --frozen' <<<"$STEPS"
+
+# --- build -------------------------------------------------------------------
+BUILD=$(awk '/^  build:$/ {on=1} /^  deploy:$/ {on=0} on' "$WF" | grep -v '^[[:space:]]*#')
+check "builder is the shared builder ci" grep -qE 'builder="?ci"?$' <<<"$BUILD"
+check "no per-repository builder" no_match_in "$BUILD" 'GITHUB_REPOSITORY#'
+check "builder created with a GC limit" \
+  grep -qE "buildx create .*--buildkitd-flags '--oci-worker-gc-keepstorage [0-9]+,[0-9]+,[0-9]+'" \
+  <<<"$(awk '{ if (sub(/\\$/, "")) printf "%s", $0; else print }' <<<"$BUILD")"
+check "no registry cache" no_match_in "$BUILD" 'type=registry|--cache-(from|to)'
+# The step: `if: always()` right before a run: line that removes the image.
+always_rm() {
+  awk '/if: always\(\)/ {a=1; next} a && /run: .*docker image rm "\$\{IMAGE\}:\$\{GITHUB_SHA\}"/ {f=1} {a=0} END {exit !f}' <<<"$BUILD"
+}
+check "loaded image removed in an always-run step" always_rm
+check "job image carries the label devops.keep" grep -qx 'LABEL devops.keep=true' "$DOCKERFILE"
 
 # --- sources -----------------------------------------------------------------
 # The run: body of the step, dedented, exactly as the runner gets it.

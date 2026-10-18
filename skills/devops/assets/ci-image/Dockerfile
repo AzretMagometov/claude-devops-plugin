@@ -5,13 +5,15 @@
 #
 # The runner keeps `container.force_pull: false` and uses the local image; a
 # job then downloads neither apt packages nor uv. The tag, UV_VERSION and the
-# `image:` line of ci.yml change together.
+# `image:` line of ci.yml change together. The label `devops.keep` keeps the
+# image from the weekly image prune on the runner host: no registry has it.
 ARG UV_VERSION=0.10.4
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 # The base image of the application image: one interpreter in CI and in production.
 FROM python:3.12-slim-bookworm
+LABEL devops.keep=true
 COPY --from=uv /uv /uvx /usr/local/bin/
 # The cache is a runner volume on another file system: copy, do not hard-link.
 # The interpreter is the image's own; uv never downloads one.

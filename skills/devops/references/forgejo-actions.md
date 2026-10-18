@@ -64,7 +64,50 @@ then costs time only on a cache miss. Do these steps once on the runner host.
    dependencies again. Look for that line in the runner log when the `test`
    job is slow.
 
-The cache grows with each new package version; `uv cache prune` in the CI
+4. Bound the disk of the runner host with a weekly timer. The CI image has
+   the label `devops.keep`: no registry has it, so the prune skips it.
+   buildx keeps builders per user, so the service runs as the user of the
+   runner service (`User=` of its unit).
+
+   ```ini
+   # /etc/systemd/system/docker-image-prune.service
+   [Unit]
+   Description=Remove Docker images and build cache older than a week
+   Requires=docker.service
+   After=docker.service
+
+   [Service]
+   Type=oneshot
+   User=<runner user>
+   ExecStart=/usr/bin/docker image prune -af --filter until=168h --filter label!=devops.keep
+   ExecStart=/usr/bin/docker buildx prune --builder ci -af --filter until=168h
+
+   # /etc/systemd/system/docker-image-prune.timer
+   [Unit]
+   Description=Weekly docker image prune
+
+   [Timer]
+   OnCalendar=weekly
+   Persistent=true
+   RandomizedDelaySec=1h
+
+   [Install]
+   WantedBy=timers.target
+   ```
+
+   ```bash
+   systemctl daemon-reload && systemctl enable --now docker-image-prune.timer
+   ```
+
+   Builders of earlier template versions, one per repository, are not used
+   any more: `docker buildx ls`, then `docker buildx rm <name>`.
+
+5. In Forgejo: every push adds a `:<sha>` version to the registry. Per owner
+   (user or organization): Settings → Packages → Cleanup rules → add a rule:
+   type `container`, keep the 5 most recent versions, remove pattern `.*`.
+   Rollback (`image_tag`) reaches only the versions the rule keeps.
+
+The uv cache grows with each new package version; `uv cache prune` in the CI
 image with the cache mounted removes the entries no longer used.
 
 ## Runner quirks the template already handles
@@ -91,9 +134,14 @@ image with the cache mounted removes the entries no longer used.
 - The runner home holds a foreign `~/.ssh/id_ed25519.pub`; ssh would offer it
   instead of the deploy key. The key goes to its own directory with
   `-F /dev/null -o IdentitiesOnly=yes`.
-- The default buildx driver cannot export cache to a registry. The template
-  creates a `docker-container` builder; the cache is an OCI image manifest,
-  because the Forgejo registry stores images only.
+- All repositories build with one `docker-container` builder, `ci`. Its
+  local cache survives between runs on the runner host; there is no registry
+  cache. The builder is created with
+  `--buildkitd-flags '--oci-worker-gc-keepstorage 1000,10000,3000'`
+  (reserved, min free, max used, MB): buildkit GC keeps the cache under
+  ~3 GB. The flag applies at creation only: to change it, `docker buildx rm
+  ci` and let the next run create the builder again.
+- The loaded `<image>:<sha>` is removed after the push, also on a failed run.
 - The image is scanned before it is pushed (`--load`, then trivy, then push).
 - Step logs are not readable through the API (a web route with a CSRF token).
 

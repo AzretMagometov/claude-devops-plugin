@@ -168,26 +168,27 @@ jobs:
           REGISTRY_USER: ${{ vars.REGISTRY_USER || github.repository_owner }}
         run: printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
 
-      # The docker-container driver can export the layer cache to the registry;
-      # the builder survives between runs on this runner.
+      # One builder for all repositories: its cache survives between runs on
+      # this runner host. buildkit GC keeps the cache under ~3 GB
+      # (keepstorage "Reserved,Free,Maximum" in MB).
       - name: Prepare the builder
         run: |
           set -euo pipefail
-          builder="${GITHUB_REPOSITORY#*/}"
+          builder=ci
           docker buildx inspect "$builder" >/dev/null 2>&1 \
-            || docker buildx create --name "$builder" --driver docker-container
+            || docker buildx create --name "$builder" --driver docker-container \
+                 --buildkitd-flags '--oci-worker-gc-keepstorage 1000,10000,3000'
           docker buildx use "$builder"
 
       # linux/amd64 is explicit: the server is amd64, development is arm64.
-      # The cache is an OCI image manifest: the Forgejo registry stores images only.
+      # The cache is the local cache of the builder; the runner host is one
+      # persistent host, so a registry cache only duplicates it.
       # `--load`, not `--push`: the image is scanned before it is published.
       - name: Build the image
         run: |
           set -euo pipefail
           docker buildx build \
             --platform linux/amd64 \
-            --cache-from "type=registry,ref=${IMAGE}:cache" \
-            --cache-to "type=registry,ref=${IMAGE}:cache,mode=max,image-manifest=true,oci-mediatypes=true" \
             --tag "${IMAGE}:${GITHUB_SHA}" \
             --load \
             .
@@ -218,10 +219,11 @@ jobs:
       - name: Publish the image
         run: docker push "${IMAGE}:${GITHUB_SHA}"
 
-      # The runner disk is small; the registry holds the image now.
+      # The runner disk is small; the registry holds the image now. A failed
+      # run leaves the loaded image too, so the step always runs.
       - name: Drop the local copy of the image
-        if: success()
-        run: docker image rm "${IMAGE}:${GITHUB_SHA}"
+        if: always()
+        run: docker image inspect "${IMAGE}:${GITHUB_SHA}" >/dev/null 2>&1 || exit 0; docker image rm "${IMAGE}:${GITHUB_SHA}"
 
       - name: Log out of the registry
         if: always()
