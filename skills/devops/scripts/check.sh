@@ -81,12 +81,12 @@ f auto_reboot "$(apt-config dump 2>/dev/null | awk -F'"' '$1=="Unattended-Upgrad
 
 f web_anchor "$(yn test -f /opt/traefik/compose.yml)"
 f docker_active "$(yn systemctl is-active docker)"
+f journald_docker "$(yn test -f /etc/systemd/journald.conf.d/zz-docker-logs.conf)"
 if systemctl is-active -q docker 2>/dev/null; then
   f compose_version "$(docker compose version --short 2>/dev/null)"
   DJ=/etc/docker/daemon.json
   if command -v jq >/dev/null && [ -s "$DJ" ]; then
     f daemon_log_driver "$(jq -r '."log-driver" // ""' "$DJ" 2>/dev/null)"
-    f daemon_max_size "$(jq -r '."log-opts"."max-size" // ""' "$DJ" 2>/dev/null)"
     f daemon_live_restore "$(jq -r '."live-restore" // ""' "$DJ" 2>/dev/null)"
   fi
   f proxy_net "$(yn docker network inspect proxy)"
@@ -175,7 +175,7 @@ version_ge() {
   return 0
 }
 docker_ok() { local v; v=$(fact compose_version); is docker_active 1 && [[ $v =~ ^[0-9]+(\.[0-9]+)*$ ]] && version_ge "$v" "$COMPOSE_MIN"; }
-daemon_ok() { is daemon_log_driver json-file && [ -n "$(fact daemon_max_size)" ] && is daemon_live_restore true; }
+daemon_ok() { is daemon_log_driver journald && is daemon_live_restore true; }
 traefik_ok() { has_word "$traefik_services" traefik && has_word "$traefik_services" socket-proxy; }
 web_ports_ok() { ufw_allows 80 && ufw_allows 443; }
 deployer_ok() { is deployer_exists 1 && is deployer_locked 1; }
@@ -215,7 +215,8 @@ traefik_services=$(awk -F'|' '$2=="traefik"{print $3}' <<<"$containers" | xargs)
 echo "-- web (web-init)"
 if is web_anchor 1; then
   check "Docker running, compose plugin $(fact compose_version) (deploy-app needs ${COMPOSE_MIN} or newer; web-init upgrades it)" docker_ok
-  check "daemon.json: json-file, max-size, live-restore" daemon_ok
+  check "daemon.json: log-driver journald, live-restore" daemon_ok
+  check "journald: container logs kept 30 days / 2G (zz-docker-logs.conf)" is journald_docker 1
   check "network proxy" is proxy_net 1
   check "Traefik stack (project traefik): traefik + socket-proxy" traefik_ok
   check "ufw: 80/tcp and 443/tcp open" web_ports_ok

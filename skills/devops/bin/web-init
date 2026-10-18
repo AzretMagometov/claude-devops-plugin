@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Web layer of a server on top of vps-init, from the local machine over SSH:
-# Docker CE → daemon.json (log rotation, live-restore) → network proxy →
+# Docker CE → daemon.json (logs to journald, live-restore) → network proxy →
 # Traefik stack /opt/traefik (traefik + socket-proxy) → ufw 80/443 →
 # user deployer (no sudo, group docker, in AllowUsers, ~/.ssh owned by root) →
 # /usr/local/bin/deploy-app → weekly image prune.
@@ -77,12 +77,32 @@ command -v jq >/dev/null || apt-get install -y -q jq
 python3 -c 'import yaml' 2>/dev/null || apt-get install -y -q python3-yaml
 systemctl enable -q --now docker
 
-# --- 2. daemon.json: add our keys, keep the others ---
+# --- 2. Container logs to journald, daemon.json: add our keys, keep the others ---
+# json-file keeps logs inside the container directory, and every deploy
+# recreates the containers: the history went with them. journald is
+# persistent and outlives the containers. The zz- name sorts after the
+# size.conf of vps-init, so these limits win. Container output comes through
+# docker.service: the default burst of 10000 lines per 30s drops lines.
+JD=/etc/systemd/journald.conf.d/zz-docker-logs.conf
+JD_WANT=$'[Journal]\nSystemMaxUse=2G\nMaxRetentionSec=30day\nRateLimitBurst=100000'
+if [ "$(cat "$JD" 2>/dev/null)" != "$JD_WANT" ]; then
+  install -d -m 755 /etc/systemd/journald.conf.d
+  printf '%s\n' "$JD_WANT" > "$JD"
+  systemctl restart systemd-journald
+  CHANGED+=("journald limits")
+fi
+
+# The merged daemon.json from the current one on stdin. log-opts is replaced,
+# not merged: json-file options such as max-size left there make dockerd
+# refuse the journald driver and not start.
+daemon_json() {
+  jq -S --argjson w '{"log-driver":"journald","log-opts":{"tag":"{{.Name}}"},"live-restore":true}' \
+    '. * $w | ."log-opts" = $w."log-opts"'
+}
 DJ=/etc/docker/daemon.json
-WANT='{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"},"live-restore":true}'
 OLD=$(jq -S . "$DJ" 2>/dev/null || echo '{}')
 [ -s "$DJ" ] && ! jq -e . "$DJ" >/dev/null 2>&1 && die "$DJ is not JSON, fix it by hand"
-NEW=$(jq -S --argjson w "$WANT" '. * $w' <<<"$OLD")
+NEW=$(daemon_json <<<"$OLD")
 if [ "$OLD" != "$NEW" ]; then
   install -d -m 755 /etc/docker
   printf '%s\n' "$NEW" > "$DJ"

@@ -23,9 +23,9 @@ f2b_sshd=1
 web_anchor=1
 docker_active=1
 compose_version=2.40.3
-daemon_log_driver=json-file
-daemon_max_size=10m
+daemon_log_driver=journald
 daemon_live_restore=true
+journald_docker=1
 proxy_net=1
 container=traefik-traefik-1|traefik|traefik|0.0.0.0:80->80/tcp, [::]:80->80/tcp, 0.0.0.0:443->443/tcp, [::]:443->443/tcp|
 container=traefik-socket-proxy-1|traefik|socket-proxy|2375/tcp|/var/run/docker.sock
@@ -117,7 +117,10 @@ case_ "no compose plugin"          "${WEB_OK/compose_version=2.40.3/compose_vers
 case_ "compose 2.35.0 is enough"   "${WEB_OK/compose_version=2.40.3/compose_version=2.35.0}" '^LAYER=web FAIL=0 ' 0
 case_ "compose 2.31.0 is too old"  "${WEB_OK/compose_version=2.40.3/compose_version=2.31.0}" 'FAIL=1 ' 1
 case_ "no proxy network"          "${WEB_OK/proxy_net=1/proxy_net=0}" 'FAIL=1 ' 1
-case_ "no log rotation"            "${WEB_OK/daemon_max_size=10m/daemon_max_size=}" 'FAIL=1 ' 1
+case_ "logs still in json-file"    "${WEB_OK/daemon_log_driver=journald/daemon_log_driver=json-file}" 'FAIL=1 ' 1
+case_ "no log driver set"          "${WEB_OK/daemon_log_driver=journald/daemon_log_driver=}" 'FAIL=1 ' 1
+case_ "live-restore off"           "${WEB_OK/daemon_live_restore=true/daemon_live_restore=false}" 'FAIL=1 ' 1
+case_ "no journald drop-in"        "${WEB_OK/journald_docker=1/journald_docker=0}" 'FAIL=1 ' 1
 case_ "deployer has sudo"          "${WEB_OK/deployer_sudo=0/deployer_sudo=1}" 'FAIL=1 ' 1
 case_ "deployer in sudo group"     "${WEB_OK/deployer_groups=deployer docker/deployer_groups=deployer docker sudo}" 'FAIL=1 ' 1
 case_ "deployer not in AllowUsers" "${WEB_OK/sshd_allowusers=ops deployer/sshd_allowusers=ops}" 'FAIL=1 ' 1

@@ -141,7 +141,11 @@ Rules the template encodes, keep them when adapting:
 - Images come from `<DEVOPS_REGISTRY>/<owner>/${COMPOSE_PROJECT_NAME}:${IMAGE_TAG}`;
   the tag is a commit hash, never `latest`. The server never builds.
 - `read_only`, `tmpfs: /tmp`, `no-new-privileges`, non-root `USER` in the
-  Dockerfile, `logging` with a size ceiling.
+  Dockerfile.
+- No `logging:`: services inherit the journald driver of the daemon (web-init),
+  so logs survive the container recreation on every deploy. They are kept
+  30 days / 2G; read them with `docker logs <name>` or
+  `journalctl CONTAINER_NAME=<name>`.
 - Variables without a working default are `${NAME:?}`.
 - Migrations run in the one-shot `migrate` service before `app` starts
   (`migration-patterns.md`).

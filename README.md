@@ -10,7 +10,7 @@ The server is built in layers. Each layer has its own idempotent script.
 | Layer | Script | What it sets up |
 |-------|--------|-----------------|
 | `vps` | `vps-init <IP> [name]` | Admin user with your key and sudo, root login closed, passwords off, ufw with port 22, fail2ban, unattended upgrades with a reboot at 04:00, BBR, swap, journal limit, optional time zone, a `Host` alias in `~/.ssh/config` |
-| `web` | `web-init <IP or alias>` | Docker CE, the Traefik stack in `/opt/traefik` with a Docker socket proxy, network `proxy`, ufw 80/443, user `deployer`, `/usr/local/bin/deploy-app`, weekly image prune |
+| `web` | `web-init <IP or alias>` | Docker CE with container logs in journald (30 days, survive redeploys), the Traefik stack in `/opt/traefik` with a Docker socket proxy, network `proxy`, ufw 80/443, user `deployer`, `/usr/local/bin/deploy-app`, weekly image prune |
 | project | `skills/devops/scripts/add-project.sh <host> <app>` | `/opt/<app>`, ownership of its `.env`, a deploy key bound to `deploy-app <app>`, repository secrets on Forgejo or GitHub |
 
 The first deploy is the first CI run. CI builds the image, pushes it to the

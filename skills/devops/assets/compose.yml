@@ -38,19 +38,15 @@ x-app-environment: &app-environment
   DATABASE_URL: postgresql://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
   REDIS_URL: redis://redis:6379/0
 
-# One machine, no log collector: without a ceiling a restarting container
-# fills the disk.
-x-logging: &logging
-  driver: json-file
-  options:
-    max-size: "10m"
-    max-file: "3"
+# Logs go to journald through the daemon setting of web-init and are kept
+# 30 days / 2G: `docker logs <name>` or `journalctl CONTAINER_NAME=<name>`.
+# No `logging:` per service: it puts the logs back into the container,
+# and every deploy recreates the container and loses them.
 
 x-application: &application
   # deploy-app passes IMAGE and IMAGE_TAG in the environment on every rollout.
   image: ${IMAGE:?}:${IMAGE_TAG:?}
   environment: *app-environment
-  logging: *logging
   # Nothing is written into the container; scratch space is tmpfs.
   read_only: true
   tmpfs:
@@ -140,7 +136,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
-    logging: *logging
 
   redis:
     image: redis:8-alpine
@@ -152,7 +147,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
-    logging: *logging
 
 volumes:
   postgres_data:

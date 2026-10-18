@@ -21,7 +21,7 @@ project is prepared on top, and the first deploy is the first CI run.
 | Layer | Made by | Contents |
 |-------|---------|----------|
 | `vps` | `vps-init <IP> <name>` | user `DEVOPS_ADMIN` with key and sudo, root closed, ufw 22, fail2ban, auto-updates with a reboot at 04:00 (none on a VPN node) |
-| `web` | `web-init <IP or alias>` | Docker, `/opt/traefik` (Traefik + socket-proxy), network `proxy`, ufw 80/443, `deployer`, `/usr/local/bin/deploy-app` |
+| `web` | `web-init <IP or alias>` | Docker with container logs in journald, `/opt/traefik` (Traefik + socket-proxy), network `proxy`, ufw 80/443, `deployer`, `/usr/local/bin/deploy-app` |
 | project | `scripts/add-project.sh` | `/opt/<app>`, `.env` ownership, deployer key for `deploy-app <app>`, repository secrets on the forge |
 
 Both init scripts and `vpn-deploy` live in `${CLAUDE_SKILL_DIR}/bin/`: run
