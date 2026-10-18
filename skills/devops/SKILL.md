@@ -109,7 +109,7 @@ the CI template (`WORKFLOW=template`). A name at the owner level
 | `REPO_STATE=missing` | create the repository (`references/forgejo-actions.md`) |
 | `MISSING=<names>` | exactly these go to add-project.sh or the open items; names not listed exist |
 | `UNKNOWN=<names>` | not in the repository and the owner level is not readable (Forgejo user secrets, organization lists without owner rights): ask the user whether they exist at the owner level |
-| `RUNNER=offline`, `none` | open item: register or start a runner with the labels of `runs-on` |
+| `RUNNER=offline`, `none` | open item: register or start a runner with the labels of `runs-on`, with the runner prerequisites of `references/forgejo-actions.md` |
 | `RUNS_WAITING` > 0 with `RUNNER` not `online` | the pipeline is stuck: no runner takes the jobs |
 | `IMAGE=absent` | normal before the first green run on `main` |
 
@@ -125,7 +125,10 @@ Adapt the templates in `assets/` to the stack, do not copy them blindly:
 - `assets/.env.example` → `.env.example` with the project variables;
 - the CI template of `DEVOPS_FORGE`, only the `test` job changes:
   `forgejo` → `assets/.forgejo/workflows/ci.yml` to `.forgejo/workflows/ci.yml`
-  (`references/forgejo-actions.md`; reads the repository variable `REGISTRY`);
+  (`references/forgejo-actions.md`; reads the repository variable `REGISTRY`;
+  the `test` job needs the runner prerequisites from there: the CI image
+  `assets/ci-image/Dockerfile` built on the runner host and the uv cache in
+  `valid_volumes`);
   `github` → `assets/.github/workflows/ci.yml` to `.github/workflows/ci.yml`
   (`references/github-actions.md`; image `ghcr.io/<owner>/<repo>`);
 - Dockerfile: non-root user with a fixed UID, and

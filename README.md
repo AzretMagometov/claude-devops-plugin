@@ -37,7 +37,9 @@ so the skill asks only for those.
 
 - Client: macOS or Linux with bash, ssh, ssh-keygen, curl and python3.
 - Forgejo as the forge: a Forgejo instance with Actions and its container
-  registry, and an API token with scope `write:repository`.
+  registry, and an API token with scope `write:repository`. The Forgejo
+  runner host needs the CI image and the uv cache volume once (runner
+  prerequisites in `skills/devops/references/forgejo-actions.md`).
 - GitHub as the forge: the `gh` CLI, logged in. Images go to GHCR.
 - Server: Ubuntu 22.04 or 24.04, reachable as root over SSH for the first
   `vps-init` run.

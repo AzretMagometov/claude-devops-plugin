@@ -50,9 +50,16 @@ defaults:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # The base image of the application image: one runtime, one behaviour.
+    # python:3.12-slim-bookworm, the base of the application image, plus uv;
+    # built once on the runner host from assets/ci-image/Dockerfile and used
+    # from there (force_pull: false). The uv cache outlives the job: the
+    # runner config lists the host path in container.valid_volumes, else the
+    # runner drops the volume and every run downloads all dependencies.
+    # See references/forgejo-actions.md, "Runner prerequisites".
     container:
-      image: python:3.12-slim-bookworm
+      image: local/ci-python:3.12-uv0.10.4
+      volumes:
+        - /opt/forgejo-runner/cache/uv:/root/.cache/uv
     # Real PostgreSQL and Redis; they answer by service name.
     services:
       postgres:
@@ -67,26 +74,42 @@ jobs:
       TEST_DATABASE_URL: postgresql://test:test@postgres:5432/test
       TEST_REDIS_URL: redis://redis:6379/0
     steps:
-      # Slim images carry no git.
-      - name: Install git
-        run: |
-          set -eux
-          apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates
-          rm -rf /var/lib/apt/lists/*
-
-      # Plain git instead of actions/checkout: the runner does not depend on a
-      # third-party action catalogue. The commit is fetched by its hash.
+      # The image has neither git nor node, so no actions/checkout: the
+      # commit comes as an archive from the API with the automatic token,
+      # which Forgejo accepts there as `Authorization: token`. A 404 means no
+      # such commit or no access. Files marked export-ignore in
+      # .gitattributes are not in the archive.
       - name: Fetch the sources
         env:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           [[ -n $REGISTRY ]] || { echo "repository variable REGISTRY is not set (Settings → Actions → Variables)"; exit 1; }
-          git init -q .
-          git config --global --add safe.directory "$PWD"
-          git fetch -q --depth 1 "https://x-access-token:${REPO_TOKEN}@${REPO_URL#https://}" "$GITHUB_SHA"
-          git checkout -q FETCH_HEAD
+          python - <<'PY'
+          import os
+          import tarfile
+          import urllib.request
+
+          env = os.environ
+          url = f"https://{env['REGISTRY']}/api/v1/repos/{env['GITHUB_REPOSITORY']}/archive/{env['GITHUB_SHA']}.tar.gz"
+          request = urllib.request.Request(url, headers={"Authorization": f"token {env['REPO_TOKEN']}"})
+
+
+          # The archive holds one top directory, <repo>/; the files go to the
+          # workspace itself. The "data" filter refuses members and links that
+          # leave the workspace.
+          def strip_top(member, path):
+              name = member.name.partition("/")[2]
+              if not name:
+                  return None
+              link = member.linkname.partition("/")[2] if member.islnk() else member.linkname
+              return tarfile.data_filter(member.replace(name=name, linkname=link, deep=False), path)
+
+
+          with urllib.request.urlopen(request, timeout=300) as response:
+              with tarfile.open(fileobj=response, mode="r|gz") as archive:
+                  archive.extractall(".", filter=strip_top)
+          PY
 
       # The runner starts service containers without waiting for them.
       - name: Wait for PostgreSQL and Redis
@@ -107,11 +130,11 @@ jobs:
                       time.sleep(1)
           PY
 
-      # The same gates a developer runs locally.
+      # The same gates a developer runs locally. uv sync takes the packages
+      # from the cache volume; only a cache miss goes to the index.
       - name: Run the gates
         run: |
           set -euo pipefail
-          pip install --no-cache-dir --root-user-action=ignore uv==0.10.4
           uv sync --frozen
           uv run ruff check .
           uv run ruff format --check .

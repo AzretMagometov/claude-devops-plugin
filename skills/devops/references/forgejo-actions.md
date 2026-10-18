@@ -19,6 +19,54 @@ good tag if the stack is not healthy.
 Rollback to any earlier build: Actions → ci → Run workflow, `image_tag` = the
 commit hash. Nothing is rebuilt.
 
+## Runner prerequisites
+
+The `test` job downloads nothing on a normal run: the image with uv is on the
+runner host, the packages are in a uv cache on the runner host, and the
+sources come as one archive from the Forgejo API. A slow route to pypi.org
+then costs time only on a cache miss. Do these steps once on the runner host.
+
+1. Build the job image from `assets/ci-image/Dockerfile`. It is
+   `python:3.12-slim-bookworm`, the base of the application image, plus uv.
+   Copy the directory to the runner host; do not copy it into the project.
+
+   ```bash
+   docker build -t local/ci-python:3.12-uv0.10.4 --build-arg UV_VERSION=0.10.4 <dir>
+   ```
+
+   The tag, `UV_VERSION` and the `image:` line of the project `ci.yml` change
+   together. The runner uses the local image only with
+   `container.force_pull: false` (the default). If the image is not on the
+   host, the runner tries to pull `local/ci-python` from Docker Hub and the
+   job fails with `pull access denied`.
+
+2. Create the cache directory:
+
+   ```bash
+   install -d /opt/forgejo-runner/cache/uv
+   ```
+
+3. Allow the cache volume in the runner `config.yml` and restart the runner:
+
+   ```yaml
+   container:
+     force_pull: false
+     valid_volumes:
+       - /opt/forgejo-runner/cache/uv
+   ```
+
+   forgejo-runner v13 (`act/container/docker/run.go`, `sanitizeConfig`)
+   matches each bind source and each named volume of the job and service
+   containers against the `valid_volumes` globs. A volume that matches no
+   entry is dropped, the runner log gets `[<path>] is not a valid volume,
+   will be ignored`, and the job runs on. An empty list drops every job
+   volume. So a missing entry does not fail the job: every run downloads all
+   dependencies again. Look for that line in the runner log when the `test`
+   job is slow.
+
+The cache grows with each new package version; `uv cache prune` in the CI
+image with the cache mounted removes the entries no longer used.
+
 ## Runner quirks the template already handles
 
 - `github.server_url` can be `http://localhost:3000` (the default ROOT_URL),
@@ -31,7 +79,15 @@ commit hash. Nothing is rebuilt.
   repositories `add-project.sh` sets `REGISTRY_USER` to `DEVOPS_REGISTRY_LOGIN`.
 - `/bin/sh` in job containers is dash, which has no `pipefail`:
   `defaults.run.shell: bash`.
-- Sources are fetched with plain `git fetch <sha>`, not `actions/checkout`.
+- The job image of `test` has neither git nor node, so no `actions/checkout`:
+  the step downloads `/api/v1/repos/{owner}/{repo}/archive/<sha>.tar.gz` with
+  the automatic token in `Authorization: token` and extracts it with Python
+  (`tarfile`, filter `data`). On this route Forgejo 15 resolves the automatic
+  token to the running task and gives it read access to the task's own
+  repository (`services/auth/method/oauth2.go`,
+  `routers/api/v1/permissions/repo_access.go`). The archive has one top
+  directory, `<repo>/`, which the step strips. The `build` job runs on the
+  runner host, which has git, and fetches the commit with `git fetch <sha>`.
 - The runner home holds a foreign `~/.ssh/id_ed25519.pub`; ssh would offer it
   instead of the deploy key. The key goes to its own directory with
   `-F /dev/null -o IdentitiesOnly=yes`.
