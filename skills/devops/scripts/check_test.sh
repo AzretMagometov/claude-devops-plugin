@@ -113,6 +113,9 @@ container=old-traefik|old|traefik|0.0.0.0:80->80/tcp|" '^LAYER=vps FAIL=1 ' 1
 case_ "traefik stack down"         "$(grep -v '^container=traefik-traefik-1' <<<"$WEB_OK")" 'FAIL=1 ' 1
 case_ "compose v5 is fine"         "${WEB_OK/compose_version=2.40.3/compose_version=5.5.1}" '^LAYER=web FAIL=0 ' 0
 case_ "no compose plugin"          "${WEB_OK/compose_version=2.40.3/compose_version=}" 'FAIL=1 ' 1
+# deploy-app renders the stack with `config --no-env-resolution` (2.35.0).
+case_ "compose 2.35.0 is enough"   "${WEB_OK/compose_version=2.40.3/compose_version=2.35.0}" '^LAYER=web FAIL=0 ' 0
+case_ "compose 2.31.0 is too old"  "${WEB_OK/compose_version=2.40.3/compose_version=2.31.0}" 'FAIL=1 ' 1
 case_ "no proxy network"          "${WEB_OK/proxy_net=1/proxy_net=0}" 'FAIL=1 ' 1
 case_ "no log rotation"            "${WEB_OK/daemon_max_size=10m/daemon_max_size=}" 'FAIL=1 ' 1
 case_ "deployer has sudo"          "${WEB_OK/deployer_sudo=0/deployer_sudo=1}" 'FAIL=1 ' 1

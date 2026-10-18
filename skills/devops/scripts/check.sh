@@ -162,8 +162,19 @@ check() { local msg=$1; shift; if "$@"; then ok "$msg"; else bad "$msg"; fi; }
 is() { [ "$(fact "$1")" = "$2" ]; }
 ufw_allows() { facts ufw_allow | grep -qxE "$1(/tcp)?"; }
 f2b_ok() { is f2b_active 1 && is f2b_sshd 1; }
-# Any plugin version: Compose went from v2 straight to v5.
-docker_ok() { is docker_active 1 && [ -n "$(fact compose_version)" ]; }
+# Compose 2.35.0 or newer: deploy-app renders a stack with
+# `config --no-env-resolution`. Compose went from v2 straight to v5.
+COMPOSE_MIN=2.35.0
+version_ge() {
+  local IFS=. i a b
+  read -r -a a <<<"$1"; read -r -a b <<<"$2"
+  for i in 0 1 2; do
+    (( 10#${a[i]:-0} > 10#${b[i]:-0} )) && return 0
+    (( 10#${a[i]:-0} < 10#${b[i]:-0} )) && return 1
+  done
+  return 0
+}
+docker_ok() { local v; v=$(fact compose_version); is docker_active 1 && [[ $v =~ ^[0-9]+(\.[0-9]+)*$ ]] && version_ge "$v" "$COMPOSE_MIN"; }
 daemon_ok() { is daemon_log_driver json-file && [ -n "$(fact daemon_max_size)" ] && is daemon_live_restore true; }
 traefik_ok() { has_word "$traefik_services" traefik && has_word "$traefik_services" socket-proxy; }
 web_ports_ok() { ufw_allows 80 && ufw_allows 443; }
@@ -203,7 +214,7 @@ traefik_services=$(awk -F'|' '$2=="traefik"{print $3}' <<<"$containers" | xargs)
 
 echo "-- web (web-init)"
 if is web_anchor 1; then
-  check "Docker running, compose plugin $(fact compose_version)" docker_ok
+  check "Docker running, compose plugin $(fact compose_version) (deploy-app needs ${COMPOSE_MIN} or newer; web-init upgrades it)" docker_ok
   check "daemon.json: json-file, max-size, live-restore" daemon_ok
   check "network proxy" is proxy_net 1
   check "Traefik stack (project traefik): traefik + socket-proxy" traefik_ok

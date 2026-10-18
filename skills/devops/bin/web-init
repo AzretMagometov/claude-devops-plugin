@@ -60,6 +60,18 @@ if [ "$ok" -ne ${#PKGS[@]} ]; then
   apt-get install -y -q "${PKGS[@]}"
   CHANGED+=("docker")
 fi
+# deploy-app renders a stack with `config --no-env-resolution`, Compose
+# 2.35.0 or newer. Docker installed before web-init may carry an older plugin.
+COMPOSE_MIN=2.35.0
+v=$(docker compose version --short 2>/dev/null || true)
+if [ "$(printf '%s\n' "$COMPOSE_MIN" "${v:-0}" | sort -V | head -1)" != "$COMPOSE_MIN" ]; then
+  apt-get update -q
+  apt-get install -y -q --only-upgrade docker-compose-plugin
+  v=$(docker compose version --short)
+  [ "$(printf '%s\n' "$COMPOSE_MIN" "$v" | sort -V | head -1)" = "$COMPOSE_MIN" ] \
+    || die "docker compose ${v} after the upgrade, deploy-app needs ${COMPOSE_MIN} or newer"
+  CHANGED+=("compose plugin ${v}")
+fi
 command -v jq >/dev/null || apt-get install -y -q jq
 # deploy-app checks the raw compose file of a project with PyYAML before compose reads it
 python3 -c 'import yaml' 2>/dev/null || apt-get install -y -q python3-yaml
