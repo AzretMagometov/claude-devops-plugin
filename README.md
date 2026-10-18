@@ -1,6 +1,7 @@
 # devops: a Claude Code plugin for VPS deploys
 
-The plugin gives Claude Code one skill, `devops`, and three shell scripts.
+The plugin gives Claude Code one skill, `devops`, and three shell scripts in
+`bin/`, plus helper scripts in `skills/devops/scripts/`.
 Together they take a fresh Ubuntu VPS to a server that runs your projects
 behind Traefik. CI deploys each project over SSH.
 
@@ -24,6 +25,13 @@ no automatic reboot.
 
 `skills/devops/scripts/check.sh <host>` reads which layers a server has and
 whether they still hold. The skill uses its last line to pick the next step.
+
+`skills/devops/scripts/forge-check.sh [project dir] [app]` reads what the
+forge already holds for a project: the repository, the API token, an online
+runner, runs waiting for a runner, the secrets and variables that the CI
+workflow reads (at the repository or the owner level), and the image in the
+registry. It sends only GET requests. Its last line lists the missing names,
+so the skill asks only for those.
 
 ## Requirements
 

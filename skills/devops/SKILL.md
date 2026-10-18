@@ -77,6 +77,45 @@ name can change after a transfer, and the name may differ from `app`):
 
 Update `repo` in `.devops-config` when it differs from the remote.
 
+## 1a. Check the forge
+
+Run this in the project directory before you ask the user anything about the
+forge (repository, token, runner, secrets, variables, image):
+
+```bash
+bash ${CLAUDE_SKILL_DIR}/scripts/forge-check.sh [project dir] [app]
+```
+
+It computes the state on every run from the forge API (GET only; Forgejo
+with the API token, GitHub with `gh`) and stores nothing. Exit code 0: the
+last line is printed. Exit code 2: usage error, missing setting, or the forge
+does not answer. Last line, one `KEY=value` per field, no spaces in values,
+lists comma-separated:
+
+```
+FORGE=forgejo HOST=git.example.com OWNER=acme OWNER_TYPE=org REPO=shop APP=shop
+IMAGE_REF=git.example.com/acme/shop TOKEN=ok REPO_STATE=exists WORKFLOW=project
+RUNNER=online RUNS_WAITING=0 SECRETS=DEPLOY_HOST,... VARS=REGISTRY MISSING= UNKNOWN= IMAGE=present
+```
+
+(one line in the real output). Required names are the `secrets.X` and
+`vars.X` that the project workflow reads (`WORKFLOW=project`), else those of
+the CI template (`WORKFLOW=template`). A name at the owner level
+(organization or user) counts for every repository of the owner.
+
+| Key | Next step |
+|-----|-----------|
+| `TOKEN=missing` or `bad` | the other facts are `unknown`: ask for the token first (open items, step 4), then run again |
+| `REPO_STATE=missing` | create the repository (`references/forgejo-actions.md`) |
+| `MISSING=<names>` | exactly these go to add-project.sh or the open items; names not listed exist |
+| `UNKNOWN=<names>` | not in the repository and the owner level is not readable (Forgejo user secrets, organization lists without owner rights): ask the user whether they exist at the owner level |
+| `RUNNER=offline`, `none` | open item: register or start a runner with the labels of `runs-on` |
+| `RUNS_WAITING` > 0 with `RUNNER` not `online` | the pipeline is stuck: no runner takes the jobs |
+| `IMAGE=absent` | normal before the first green run on `main` |
+
+`IMAGE_REF` is the image that `/opt/<app>/.env` on the server must name in
+`IMAGE`: compare it with the server when a repository moved to another owner.
+
 ## 2. Prepare the project repository
 
 Adapt the templates in `assets/` to the stack, do not copy them blindly:
@@ -201,6 +240,8 @@ migrate command against SQLite, in a python container),
 `scripts/config_test.sh` (`~/.config/devops/env` loading and missing keys),
 `scripts/add-project_test.sh` (both forges with ssh, gh and curl shims, no
 server),
+`scripts/forge-check_test.sh` (both forges with curl and gh shims answering
+from fixtures, no forge),
 `scripts/integration_test.sh` (vps-init + web-init +
 add-project.sh + real rollouts in a local systemd container, ~10 min),
 `scripts/integration_vpn_test.sh` (vpn-deploy on a fresh container

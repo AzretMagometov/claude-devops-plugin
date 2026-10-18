@@ -31,6 +31,15 @@ installed and `gh auth status` succeeds. Otherwise it prints the three
 `gh secret set` commands in the `Waiting for you:` block, and the private
 key waits in a temporary directory until the user deletes it.
 
+`scripts/forge-check.sh` with `DEVOPS_FORGE=github` reads the state through
+`gh api`: secret and variable names of the repository, the organization
+entries the repository may read (`actions/organization-secrets`,
+`actions/organization-variables`), queued runs, self-hosted runners only when
+`runs-on` names `self-hosted` (otherwise `RUNNER=hosted`), and the package
+list of the owner. GET of one package answers 404 without `read:packages`,
+the list answers 403, so the script reads the list: without the scope
+`IMAGE=unknown`.
+
 The server token is a classic PAT: GHCR does not accept fine-grained tokens.
 `read:packages` cannot push, so a stolen server `.env` cannot replace an image.
 

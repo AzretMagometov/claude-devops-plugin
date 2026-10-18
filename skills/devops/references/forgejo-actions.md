@@ -98,6 +98,27 @@ curl -fsS -H @"$AUTH" "$API/repos/$R/actions/secrets"
 rm -f "$AUTH"
 ```
 
+## Reading the forge state
+
+`scripts/forge-check.sh` reads these endpoints with GET only (checked
+against Forgejo 15.0.10, `https://<DEVOPS_REGISTRY>/swagger.v1.json`):
+
+| Fact | Endpoint | Note |
+|------|----------|------|
+| token | `/user` | 401/403: token rejected |
+| repository | `/repos/{owner}/{repo}` | 200 or 404 |
+| owner type | `/orgs/{owner}` | 200 organization, 404 user (`/users/{name}` answers 200 for both) |
+| secret names | `/repos/{o}/{r}/actions/secrets`, `/orgs/{org}/actions/secrets` | users have no list endpoint for their own secrets |
+| variable names | `/repos/{o}/{r}/actions/variables`, `/orgs/{org}/actions/variables`, `/user/actions/variables` | the user endpoint shows only the token user |
+| runners | `/admin/actions/runners` (instance runners; `read:admin` as a site administrator), `/orgs/{org}/actions/runners` or `/user/actions/runners`, `/repos/{o}/{r}/actions/runners` | each endpoint lists only runners of its own scope |
+| stuck pipeline | `/repos/{o}/{r}/actions/runs?status=waiting` | `total_count` |
+| image | `/packages/{owner}?type=container&q=<app>` | `q` matches a substring: compare `name` exactly |
+
+Owner-level secrets and variables apply to every repository of the owner; a
+repository entry with the same name wins. Runner `status`: `idle` (online, no
+job for 10 s) and `active` (running a job) are online, `offline` means no
+contact for over a minute (`models/actions/runner.go`).
+
 Repository variables (non-secret): `POST`/`PUT
 $API/repos/$R/actions/variables/<NAME>` with `{"value": "..."}`.
 Names starting with `GITHUB_` or `GITEA_` are reserved.
