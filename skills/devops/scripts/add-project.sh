@@ -6,17 +6,26 @@
 #   a deploy key bound to `deploy-app <app>` in /home/deployer/.ssh/authorized_keys,
 #   the repository secrets DEPLOY_SSH_KEY, DEPLOY_HOST, DEPLOY_HOST_KEY.
 #
-#   bash add-project.sh <host> <app>
+#   bash add-project.sh <host> <app>     (run in the project directory)
 #
+# The repository is <owner>/<name> of `git remote get-url origin` of the
+# working directory, else of "repo" in .devops-config, else
+# $DEVOPS_REGISTRY_USER/<app> (devops_repo in lib/config.sh). The image is
+# <registry>/<owner>/<app> in lower case: the app name, not the repository name.
 # DEVOPS_FORGE (~/.config/devops/env) picks where the repository lives:
-#   forgejo (default)  FORGEJO_API_TOKEN (scope write:repository) uploads the
-#                      secrets and the repository variable REGISTRY (=
-#                      $DEVOPS_REGISTRY, read by the CI template) through the
-#                      API; FORGEJO_REPO defaults to $DEVOPS_REGISTRY_USER/<app>,
-#                      FORGEJO_URL to https://$DEVOPS_REGISTRY.
+#   forgejo (default)  the API token (FORGEJO_API_TOKEN, else the output of
+#                      DEVOPS_FORGEJO_TOKEN_CMD; scopes write:repository and
+#                      write:organization) uploads the secrets and the
+#                      repository variables REGISTRY (= $DEVOPS_REGISTRY, read
+#                      by the CI template) and, when the owner is not the
+#                      login, REGISTRY_USER (= $DEVOPS_REGISTRY_LOGIN);
+#                      FORGEJO_REPO overrides the repository, FORGEJO_URL
+#                      defaults to https://$DEVOPS_REGISTRY.
 #   github             `gh secret set` uploads the secrets when gh is logged in;
-#                      GITHUB_REPO defaults to $DEVOPS_REGISTRY_USER/<app>, the
-#                      image to ghcr.io/<owner>/<app> in lower case.
+#                      GITHUB_REPO overrides the repository, the image is
+#                      ghcr.io/<owner>/<app> in lower case.
+# An owner other than DEVOPS_REGISTRY_LOGIN (an organization cannot log in to
+# the registry) needs REGISTRY_USER=<login> in /opt/<app>/.env.
 # Without the token or gh the private key stays in a temporary directory for a
 # manual paste, and the script says how to delete it.
 #
@@ -30,26 +39,41 @@ DEVOPS_DIR=$(cd "$(dirname "$f")/.." && pwd)
 # shellcheck source=SCRIPTDIR/../lib/config.sh
 . "$DEVOPS_DIR/lib/config.sh"
 die() { echo "Error: $*" >&2; exit 1; }
+# The login, not the owner: the owner may come from the git remote.
 case $DEVOPS_FORGE in
-  forgejo) devops_require DEVOPS_ADMIN DEVOPS_REGISTRY DEVOPS_REGISTRY_USER || exit 1 ;;
-  github) devops_require DEVOPS_ADMIN DEVOPS_REGISTRY_USER || exit 1 ;;
+  forgejo) devops_require DEVOPS_ADMIN DEVOPS_REGISTRY DEVOPS_REGISTRY_LOGIN || exit 1 ;;
+  github) devops_require DEVOPS_ADMIN DEVOPS_REGISTRY_LOGIN || exit 1 ;;
   *) die "DEVOPS_FORGE=${DEVOPS_FORGE}: expected forgejo or github" ;;
 esac
-ADMIN=$DEVOPS_ADMIN
+ADMIN=$DEVOPS_ADMIN LOGIN=$DEVOPS_REGISTRY_LOGIN
 [[ $# -eq 2 ]] || die "usage: $(basename "$0") <host> <app>"
 HOST=$1 APP=$2
 [[ $APP =~ ^[a-z0-9][a-z0-9_-]{0,40}$ ]] || die "project name \"${APP}\" does not match ^[a-z0-9][a-z0-9_-]{0,40}$"
+# DEVOPS_REGISTRY_USER is a fallback only and the login is set, so the owner is never empty.
+devops_repo . || DEVOPS_REPO_OWNER=$LOGIN
 IMAGE=$(devops_image "$APP")
+# Registry names are lower case, logins compare the same way.
+lower() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
+[[ $(lower "$DEVOPS_REPO_OWNER") == "$(lower "$LOGIN")" ]] && ORG=0 || ORG=1
+REPO=$DEVOPS_REPO_OWNER/${DEVOPS_REPO_NAME:-$APP}
 if [[ $DEVOPS_FORGE == github ]]; then
-  REPO=${GITHUB_REPO:-$DEVOPS_REGISTRY_USER/$APP}
+  REPO=${GITHUB_REPO:-$REPO}
   PULL_TOKEN="a GitHub personal access token (classic) with scope read:packages"
-  ENV_HINT="IMAGE=${IMAGE}, REGISTRY_USER is your GitHub login, REGISTRY_TOKEN is ${PULL_TOKEN}"
+  ENV_HINT="IMAGE=${IMAGE}, REGISTRY_USER=${LOGIN}, REGISTRY_TOKEN is ${PULL_TOKEN}"
 else
   FORGEJO_URL=${FORGEJO_URL:-https://$DEVOPS_REGISTRY}
-  REPO=${FORGEJO_REPO:-$DEVOPS_REGISTRY_USER/$APP}
-  PULL_TOKEN="a Forgejo token with scope read:package"
-  ENV_HINT="REGISTRY_TOKEN is a read:package token"
+  REPO=${FORGEJO_REPO:-$REPO}
+  PULL_TOKEN="a Forgejo token of ${LOGIN} with scope read:package"
+  ENV_HINT="IMAGE=${IMAGE}, REGISTRY_USER=${LOGIN}, REGISTRY_TOKEN is ${PULL_TOKEN}"
+  # Before the server is touched: a broken keychain lookup stops the run.
+  if [[ -n ${FORGEJO_API_TOKEN:-} || -n ${DEVOPS_FORGEJO_TOKEN_CMD:-} ]]; then
+    TOKEN=$(devops_forgejo_token) || exit 1
+  else
+    TOKEN=""
+  fi
 fi
+[[ $DEVOPS_REPO_SOURCE == remote ]] && FROM="the git remote" || FROM=$DEVOPS_REPO_SOURCE
+echo "✓ repository ${REPO} (from ${FROM})"
 COMMENT=$APP-deploy@$DEVOPS_FORGE
 SSH=(ssh -o ConnectTimeout=15 "$ADMIN@$HOST")
 WAIT=()
@@ -77,6 +101,7 @@ if [ -f "$ENV" ]; then
   echo "env=1"
   grep -qE '^REGISTRY_TOKEN=.+' "$ENV" && echo "registry_token=1" || echo "registry_token=0"
   grep -qE '^IMAGE=.+' "$ENV" && echo "image=1" || echo "image=0"
+  grep -qE '^REGISTRY_USER=.+' "$ENV" && echo "registry_user=1" || echo "registry_user=0"
 else
   echo "env=0"
 fi
@@ -95,6 +120,8 @@ if [[ $(fact env) == 1 ]]; then
     || WAIT+=("REGISTRY_TOKEN in /opt/${APP}/.env: ${PULL_TOKEN}")
   [[ $(fact image) == 1 ]] \
     || WAIT+=("IMAGE=${IMAGE} in /opt/${APP}/.env: deploy-app cannot roll out without it")
+  [[ $ORG == 0 || $(fact registry_user) == 1 ]] \
+    || WAIT+=("REGISTRY_USER=${LOGIN} in /opt/${APP}/.env: the owner ${DEVOPS_REPO_OWNER} cannot log in to the registry")
 else
   WAIT+=("/opt/${APP}/.env from the template assets/.env.example (${ENV_HINT}):
    ssh ${ADMIN}@${HOST} 'sudo install -m 640 -o root -g deployer /dev/stdin /opt/${APP}/.env' < .env")
@@ -106,15 +133,27 @@ if [[ $DEVOPS_FORGE == github ]]; then
   command -v gh > /dev/null && gh auth status > /dev/null 2>&1 && UPLOAD=1 || UPLOAD=0
   put_secret() { gh secret set "$1" --repo "$REPO" > /dev/null; }
 else
-  [[ -n ${FORGEJO_API_TOKEN:-} ]] && UPLOAD=1 || UPLOAD=0
+  [[ -n $TOKEN ]] && UPLOAD=1 || UPLOAD=0
   API=$FORGEJO_URL/api/v1/repos/$REPO/actions
+  # The token goes to curl in a header file only the user can read, not in
+  # its arguments, which ps shows to everyone.
+  AUTH=$(umask 077 && mktemp "${TMPDIR:-/tmp}/add-project-auth.XXXXXX")
+  trap 'rm -f "$AUTH"' EXIT
+  printf 'Authorization: token %s\n' "$TOKEN" > "$AUTH"
   # forgejo_api METHOD PATH FIELD < value: JSON {FIELD: value} to the API.
   forgejo_api() {
     python3 -c 'import json,sys; print(json.dumps({sys.argv[1]: sys.stdin.read()}))' "$3" \
-      | curl -fsS -X "$1" -H "Authorization: token $FORGEJO_API_TOKEN" \
+      | curl -fsS -X "$1" -H @"$AUTH" \
           -H 'Content-Type: application/json' --data @- "$API/$2" > /dev/null
   }
   put_secret() { forgejo_api PUT "secrets/$1" data; }
+  # put_variable NAME < value: POST creates it, PUT updates an existing one.
+  put_variable() {
+    local v
+    v=$(cat)
+    printf '%s' "$v" | forgejo_api POST "variables/$1" value 2>/dev/null \
+      || printf '%s' "$v" | forgejo_api PUT "variables/$1" value
+  }
 fi
 
 if [[ $(fact key) == 1 ]]; then
@@ -139,11 +178,11 @@ else
    gh secret set DEPLOY_HOST --repo ${REPO} --body '${IP}'
    gh secret set DEPLOY_HOST_KEY --repo ${REPO} --body '${IP} $(fact host_key)'")
   else
-    WAIT+=("repository secrets of ${REPO} (Settings → Actions → Secrets) and the variable REGISTRY (Settings → Actions → Variables), or run again with FORGEJO_API_TOKEN:
+    WAIT+=("repository secrets of ${REPO} (Settings → Actions → Secrets) and the variable REGISTRY (Settings → Actions → Variables), or run again with the API token (DEVOPS_FORGEJO_TOKEN_CMD):
    DEPLOY_SSH_KEY  = contents of ${KEY} (pbcopy < ${KEY}), then: rm -P ${KEY}
    DEPLOY_HOST     = ${IP}
    DEPLOY_HOST_KEY = ${IP} $(fact host_key)
-   REGISTRY        = ${DEVOPS_REGISTRY} (variable, not secret)")
+   REGISTRY        = ${DEVOPS_REGISTRY} (variable, not secret)$([[ $ORG == 0 ]] || printf '\n   REGISTRY_USER   = %s (variable, not secret)' "$LOGIN")")
   fi
   LINE="restrict,command=\"/usr/local/bin/deploy-app ${APP}\" $(cut -d' ' -f1,2 "$KEY.pub") ${COMMENT}"
   rm -f "$KEY.pub"
@@ -163,13 +202,15 @@ fi
 if [[ $DEVOPS_FORGE == forgejo && $UPLOAD == 1 ]]; then
   # The CI template builds the image and source URLs from this variable:
   # github.server_url can be an address the job container cannot reach.
-  # POST creates it, PUT updates an existing one.
-  printf '%s' "$DEVOPS_REGISTRY" | forgejo_api POST variables/REGISTRY value 2>/dev/null \
-    || printf '%s' "$DEVOPS_REGISTRY" | forgejo_api PUT variables/REGISTRY value \
-    || die "Forgejo rejected the variable REGISTRY for ${REPO}"
+  printf '%s' "$DEVOPS_REGISTRY" | put_variable REGISTRY || die "Forgejo rejected the variable REGISTRY for ${REPO}"
   echo "✓ variable REGISTRY=${DEVOPS_REGISTRY} in ${REPO}"
-  curl -fsS -H "Authorization: token $FORGEJO_API_TOKEN" "$API/secrets" | grep -qE '"name":"[A-Z0-9_]*REGISTRY_TOKEN"' \
-    || WAIT+=("secret REGISTRY_TOKEN (or <PREFIX>_REGISTRY_TOKEN, as in the project ci.yml) in ${REPO}: a Forgejo token with scope write:package (CI pushes the image)")
+  # The CI template logs in as vars.REGISTRY_USER, else as the owner.
+  if [[ $ORG == 1 ]]; then
+    printf '%s' "$LOGIN" | put_variable REGISTRY_USER || die "Forgejo rejected the variable REGISTRY_USER for ${REPO}"
+    echo "✓ variable REGISTRY_USER=${LOGIN} in ${REPO}: the owner ${DEVOPS_REPO_OWNER} cannot log in to the registry"
+  fi
+  curl -fsS -H @"$AUTH" "$API/secrets" | grep -qE '"name":"[A-Z0-9_]*REGISTRY_TOKEN"' \
+    || WAIT+=("secret REGISTRY_TOKEN (or <PREFIX>_REGISTRY_TOKEN, as in the project ci.yml) in ${REPO}: a Forgejo token of ${LOGIN} with scope write:package (CI pushes the image)")
 fi
 
 if [[ ${#WAIT[@]} -eq 0 ]]; then

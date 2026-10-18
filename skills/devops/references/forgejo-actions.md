@@ -8,7 +8,7 @@ pipeline. Only the `test` job is stack-specific.
 | Job | When | What |
 |-----|------|------|
 | `test` | every push and pull request | project gates against real PostgreSQL and Redis service containers |
-| `build` | push to `main` after green `test` | buildx build (linux/amd64) → trivy scan → push `<DEVOPS_REGISTRY>/<DEVOPS_REGISTRY_USER>/<app>:<sha>` |
+| `build` | push to `main` after green `test` | buildx build (linux/amd64) → trivy scan → push `<DEVOPS_REGISTRY>/<owner>/<app>:<sha>` (lower case) |
 | `deploy` | after `build`, or manual run | `ssh deployer@<host> "deploy <sha>"` |
 
 The `deploy` job does not run compose. The deployer key on the server is bound
@@ -24,10 +24,11 @@ commit hash. Nothing is rebuilt.
 - `github.server_url` can be `http://localhost:3000` (the default ROOT_URL),
   unreachable from the job container. URLs are built from the repository
   variable `REGISTRY` (`https://${{ vars.REGISTRY }}/${{ github.repository }}`);
-  `add-project.sh` with `FORGEJO_API_TOKEN` sets it to `DEVOPS_REGISTRY`.
+  `add-project.sh` with the API token sets it to `DEVOPS_REGISTRY`.
   A job fails at once with a clear message when it is not set.
-- The registry login is `github.repository_owner`. For a repository of an
-  organization, put the login of the token owner into that step.
+- The registry login is the repository variable `REGISTRY_USER`, else
+  `github.repository_owner`. An organization cannot log in: for its
+  repositories `add-project.sh` sets `REGISTRY_USER` to `DEVOPS_REGISTRY_LOGIN`.
 - `/bin/sh` in job containers is dash, which has no `pipefail`:
   `defaults.run.shell: bash`.
 - Sources are fetched with plain `git fetch <sha>`, not `actions/checkout`.
@@ -64,33 +65,39 @@ ssh <admin>@<host> cat /etc/ssh/ssh_host_ed25519_key.pub | awk -v h=<IP> '{print
 
 ## Repository and secrets through the API
 
-API token: `.forgejo-api-token` in the project root (git-ignored) or
-`FORGEJO_API_TOKEN`; scope `write:repository`. Checked against Forgejo
-13.0.2 (`https://<DEVOPS_REGISTRY>/api/swagger`).
+API token: `FORGEJO_API_TOKEN`, else the output of `DEVOPS_FORGEJO_TOKEN_CMD`
+(a keychain lookup, never a plain-text file); scopes `write:repository` and
+`write:organization` (secrets of an organization repository; the login must
+be an owner of the organization). Owner and repository come from the git
+remote (`config-schema.md`). Checked against Forgejo 13.0.2
+(`https://<DEVOPS_REGISTRY>/api/swagger`).
 
 ```bash
-. ~/.config/devops/env   # DEVOPS_REGISTRY, DEVOPS_REGISTRY_USER
+. ${CLAUDE_SKILL_DIR}/lib/config.sh && devops_repo .   # DEVOPS_REGISTRY, DEVOPS_REPO_OWNER, DEVOPS_REPO_NAME
 API=https://$DEVOPS_REGISTRY/api/v1
-AUTH="Authorization: token $(cat .forgejo-api-token)"
+R=$DEVOPS_REPO_OWNER/${DEVOPS_REPO_NAME:-<app>}
+# The header goes in a file only you can read: curl arguments show in ps.
+AUTH=$(umask 077 && mktemp) && printf 'Authorization: token %s\n' "$(devops_forgejo_token)" > "$AUTH"
 
 # Create the repository if it does not exist
-curl -fsS -H "$AUTH" "$API/repos/$DEVOPS_REGISTRY_USER/<app>" >/dev/null \
-  || curl -fsS -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+curl -fsS -H @"$AUTH" "$API/repos/$R" >/dev/null \
+  || curl -fsS -X POST -H @"$AUTH" -H 'Content-Type: application/json' \
        -d '{"name":"<app>","private":true}' "$API/user/repos"
 
 # Create or update a secret; the value comes on stdin, not in argv
 put_secret() {
   python3 -c 'import json,sys; print(json.dumps({"data": sys.stdin.read()}))' \
-    | curl -fsS -X PUT -H "$AUTH" -H 'Content-Type: application/json' \
-        --data @- "$API/repos/$DEVOPS_REGISTRY_USER/<app>/actions/secrets/$1"
+    | curl -fsS -X PUT -H @"$AUTH" -H 'Content-Type: application/json' \
+        --data @- "$API/repos/$R/actions/secrets/$1"
 }
 printf '%s' '<IP>' | put_secret DEPLOY_HOST   # <<< would append a newline
 put_secret DEPLOY_SSH_KEY < "$KEY_DIR/deployer"
 
 # Names only; values are never readable back
-curl -fsS -H "$AUTH" "$API/repos/$DEVOPS_REGISTRY_USER/<app>/actions/secrets"
+curl -fsS -H @"$AUTH" "$API/repos/$R/actions/secrets"
+rm -f "$AUTH"
 ```
 
 Repository variables (non-secret): `POST`/`PUT
-$API/repos/$DEVOPS_REGISTRY_USER/<app>/actions/variables/<NAME>` with `{"value": "..."}`.
+$API/repos/$R/actions/variables/<NAME>` with `{"value": "..."}`.
 Names starting with `GITHUB_` or `GITEA_` are reserved.

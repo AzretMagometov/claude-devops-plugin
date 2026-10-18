@@ -57,6 +57,9 @@ export PATH="$W/bin:$PATH" TMPDIR="$W/tmp"
 # Settings of the scripts under test; the real ~/.config/devops/env is never read.
 export DEVOPS_CONFIG=/dev/null DEVOPS_ADMIN=ops DEVOPS_PUBKEY_FILE="$W/admin_key.pub" \
   DEVOPS_REGISTRY=git.example.com DEVOPS_REGISTRY_USER=ops
+# Out of this checkout: add-project.sh reads the owner from the git remote of
+# the working directory, and $W has none, so the owner is DEVOPS_REGISTRY_USER.
+cd "$W" || exit 1
 # The remote commands are assembled here on purpose, with local values in them.
 # shellcheck disable=SC2029
 admin() { ssh "$DEVOPS_ADMIN@$HOST" "$@"; }

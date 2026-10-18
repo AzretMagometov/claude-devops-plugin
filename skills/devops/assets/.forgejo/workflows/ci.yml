@@ -7,12 +7,13 @@
 #
 # Adapt to the project: the `test` job only (image, services, steps).
 #
-# Repository variable (Settings → Actions → Variables; add-project.sh sets it
-# with FORGEJO_API_TOKEN):
+# Repository variables (Settings → Actions → Variables; add-project.sh sets
+# them with the API token):
 #   REGISTRY         host of the Forgejo instance, e.g. git.example.com: the
 #                    registry of the image and the address of the sources
 #   REGISTRY_USER    optional: login of the REGISTRY_TOKEN owner; required when
-#                    the repository owner is an organization (set it by hand)
+#                    the repository owner is an organization (add-project.sh
+#                    sets it to DEVOPS_REGISTRY_LOGIN)
 #
 # Repository secrets (Settings → Actions → Secrets, or the API):
 #   REGISTRY_TOKEN   Forgejo token, scope write:package — pushes the image

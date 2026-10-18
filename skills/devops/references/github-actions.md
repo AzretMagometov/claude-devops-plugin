@@ -26,7 +26,7 @@ Differences from the Forgejo template:
 | server `/opt/<app>/.env` | `REGISTRY_TOKEN` | personal access token (classic), scope `read:packages` only |
 
 `add-project.sh` sets the three secrets with `gh secret set --repo
-<owner>/<app>` (`GITHUB_REPO` overrides the repository) when `gh` is
+<owner>/<repo>` of the git remote (`GITHUB_REPO` overrides it) when `gh` is
 installed and `gh auth status` succeeds. Otherwise it prints the three
 `gh secret set` commands in the `Waiting for you:` block, and the private
 key waits in a temporary directory until the user deletes it.

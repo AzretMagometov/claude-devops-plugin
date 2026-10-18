@@ -138,7 +138,7 @@ Rules the template encodes, keep them when adapting:
   on `backend`. A published port bypasses ufw (`check.sh` fails on it).
 - Every Traefik router, service and middleware name starts with
   `${COMPOSE_PROJECT_NAME}`.
-- Images come from `<DEVOPS_REGISTRY>/<DEVOPS_REGISTRY_USER>/${COMPOSE_PROJECT_NAME}:${IMAGE_TAG}`;
+- Images come from `<DEVOPS_REGISTRY>/<owner>/${COMPOSE_PROJECT_NAME}:${IMAGE_TAG}`;
   the tag is a commit hash, never `latest`. The server never builds.
 - `read_only`, `tmpfs: /tmp`, `no-new-privileges`, non-root `USER` in the
   Dockerfile, `logging` with a size ceiling.

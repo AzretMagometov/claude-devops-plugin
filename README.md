@@ -102,7 +102,9 @@ chmod 600 ~/.config/devops/env
 | `DEVOPS_ACME_EMAIL` | none | Let's Encrypt account address for `web-init`. An argument overrides it. |
 | `DEVOPS_FORGE` | `forgejo` | `forgejo` or `github`. Picks the CI template and how `add-project.sh` sets secrets. |
 | `DEVOPS_REGISTRY` | none | Forgejo host: container registry and API. Not used with `github`, which always uses `ghcr.io`. |
-| `DEVOPS_REGISTRY_USER` | none | Owner of the repositories and images: a Forgejo user, or a GitHub user or organization. |
+| `DEVOPS_REGISTRY_USER` | none | Fallback owner of the repositories and images when the project has no git remote. Scripts take the owner (user or organization) from `git remote get-url origin` first. |
+| `DEVOPS_REGISTRY_LOGIN` | `DEVOPS_REGISTRY_USER` | Registry login, a real user: an organization owns images but cannot log in. |
+| `DEVOPS_FORGEJO_TOKEN_CMD` | none | Command that prints the Forgejo API token, e.g. `security find-generic-password -s devops-forgejo -a ops -w`. Scopes `write:repository` and `write:organization`. `FORGEJO_API_TOKEN` in the environment wins. |
 
 An environment variable with the same name wins over the file.
 `DEVOPS_CONFIG` points the scripts to another file. A missing required key
@@ -135,16 +137,19 @@ them by hand.
 4. Prepare the server for the project. Send the project `.env` over SSH stdin
    to `/opt/<app>/.env` first.
 
-   With Forgejo (`DEVOPS_FORGE=forgejo`):
+   Run it in the project directory: the repository comes from its git
+   remote. With Forgejo (`DEVOPS_FORGE=forgejo`), store the API token in the
+   keychain once and point `DEVOPS_FORGEJO_TOKEN_CMD` at it:
 
    ```bash
-   FORGEJO_API_TOKEN=<token> bash skills/devops/scripts/add-project.sh web1 myapp
+   security add-generic-password -s devops-forgejo -a ops -w
+   bash <plugin>/skills/devops/scripts/add-project.sh web1 myapp
    ```
 
    With GitHub (`DEVOPS_FORGE=github`, `gh auth status` succeeds):
 
    ```bash
-   bash skills/devops/scripts/add-project.sh web1 myapp
+   bash <plugin>/skills/devops/scripts/add-project.sh web1 myapp
    ```
 
 5. Point the DNS A record of the domain to the server IP. Check it with

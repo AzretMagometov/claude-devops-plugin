@@ -37,7 +37,10 @@ sourced, chmod 600), template `env.example`: `DEVOPS_ADMIN` (required),
 `DEVOPS_ACME_EMAIL` (web-init), `DEVOPS_FORGE` (`forgejo` by default, or
 `github`: CI template and how add-project.sh sets secrets),
 `DEVOPS_REGISTRY` (Forgejo host; not used with `github`, the registry there is
-`ghcr.io`) and `DEVOPS_REGISTRY_USER` (owner of the repositories on the forge). An environment variable of the same
+`ghcr.io`), `DEVOPS_REGISTRY_USER` (fallback owner when the project has no git
+remote), `DEVOPS_REGISTRY_LOGIN` (registry login, a real user; default
+`DEVOPS_REGISTRY_USER`) and `DEVOPS_FORGEJO_TOKEN_CMD` (command printing the
+Forgejo API token from the keychain). An environment variable of the same
 name wins over the file; `DEVOPS_CONFIG` points to another file. A missing
 required key stops the script with the key name and the file path.
 
@@ -64,7 +67,15 @@ not stop the run: show them to the user next to the next step.
 | `FAIL=<n>` with n > 0 | show the FAIL lines, stop. Rerunning the init script of that layer repairs its contract; a public port or a mounted socket is fixed in the project that owns the container |
 
 Run `check.sh` again after each layer. Read `.devops-config` if the project
-has one (`references/config-schema.md`), otherwise write it.
+has one (`references/config-schema.md`), otherwise write it. Do not ask the
+user for the repository: take it from `git remote get-url origin` (owner and
+name can change after a transfer, and the name may differ from `app`):
+
+```bash
+. ${CLAUDE_SKILL_DIR}/lib/config.sh && devops_repo . && echo "$DEVOPS_REPO_OWNER/$DEVOPS_REPO_NAME on $DEVOPS_REPO_HOST"
+```
+
+Update `repo` in `.devops-config` when it differs from the remote.
 
 ## 2. Prepare the project repository
 
@@ -81,7 +92,7 @@ Adapt the templates in `assets/` to the stack, do not copy them blindly:
 - Dockerfile: non-root user with a fixed UID, and
   `COPY docker-compose.yml /app/docker-compose.yml` — the deploy script reads
   the compose file from the image;
-- `.gitignore`: `.env`, `.forgejo-api-token`.
+- `.gitignore`: `.env`.
 
 Validate: `IMAGE=<registry>/<owner>/<app> docker compose --env-file <dummy env> config -q`
 (deploy-app passes `IMAGE` in the environment) and `actionlint`.
@@ -94,7 +105,9 @@ production is CI. One script deploys every project: `web-init` installs
 reruns replace it when the file in the skill changes.
 
 ```bash
-FORGEJO_API_TOKEN=… bash ${CLAUDE_SKILL_DIR}/scripts/add-project.sh <host> <app>
+# in the project directory: the repository comes from its git remote
+bash ${CLAUDE_SKILL_DIR}/scripts/add-project.sh <host> <app>
+# Forgejo token: DEVOPS_FORGEJO_TOKEN_CMD (keychain) or FORGEJO_API_TOKEN
 # DEVOPS_FORGE=github: no token, gh must be logged in (gh auth status)
 ```
 
@@ -112,11 +125,18 @@ FORGEJO_API_TOKEN=… bash ${CLAUDE_SKILL_DIR}/scripts/add-project.sh <host> <ap
   `restrict,command="/usr/local/bin/deploy-app <app>" ssh-ed25519 AAAA… <app>-deploy@<forge>`.
   An existing line is kept; to rotate, delete it and run again;
 - the secrets `DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `DEPLOY_HOST_KEY`, then the
-  private key is deleted. Forgejo: with `FORGEJO_API_TOKEN` (scope
-  `write:repository`; `FORGEJO_REPO` defaults to `<DEVOPS_REGISTRY_USER>/<app>`),
-  also the repository variable `REGISTRY` = `DEVOPS_REGISTRY`. GitHub: with
-  `gh secret set` when `gh auth status` succeeds (`GITHUB_REPO` defaults to
-  `<DEVOPS_REGISTRY_USER>/<app>`). Without the token or `gh` the key stays in a
+  private key is deleted. The repository is `<owner>/<name>` of the git
+  remote (`references/config-schema.md`, "Owner and repository").
+  Forgejo: with the API token (`FORGEJO_API_TOKEN`, else the output of
+  `DEVOPS_FORGEJO_TOKEN_CMD`; scopes `write:repository` and
+  `write:organization`; `FORGEJO_REPO` overrides the repository), also the
+  repository variable `REGISTRY` = `DEVOPS_REGISTRY`, and `REGISTRY_USER` =
+  `DEVOPS_REGISTRY_LOGIN` when the owner is an organization. A failing token
+  command stops the run with the `security add-generic-password` line to
+  store the token. GitHub: with `gh secret set` when `gh auth status`
+  succeeds (`GITHUB_REPO` overrides the repository). An owner other than the
+  login also needs `REGISTRY_USER=<login>` in `/opt/<app>/.env`, an open
+  item when it is missing. Without the token or `gh` the key stays in a
   temporary directory, and the open items give the paste or `gh` commands
   and the delete command;
 - prints `DONE <app>@<host>`, or the open items under `Waiting for you:`
