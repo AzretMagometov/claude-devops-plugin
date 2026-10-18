@@ -209,8 +209,11 @@ if [[ $DEVOPS_FORGE == forgejo && $UPLOAD == 1 ]]; then
     printf '%s' "$LOGIN" | put_variable REGISTRY_USER || die "Forgejo rejected the variable REGISTRY_USER for ${REPO}"
     echo "✓ variable REGISTRY_USER=${LOGIN} in ${REPO}: the owner ${DEVOPS_REPO_OWNER} cannot log in to the registry"
   fi
-  curl -fsS -H @"$AUTH" "$API/secrets" | grep -qE '"name":"[A-Z0-9_]*REGISTRY_TOKEN"' \
-    || WAIT+=("secret REGISTRY_TOKEN (or <PREFIX>_REGISTRY_TOKEN, as in the project ci.yml) in ${REPO}: a Forgejo token of ${LOGIN} with scope write:package (CI pushes the image)")
+  # An organization secret serves every repository of the organization.
+  has_registry_token() { curl -fsS -H @"$AUTH" "$1" | grep -qE '"name":"[A-Z0-9_]*REGISTRY_TOKEN"'; }
+  has_registry_token "$API/secrets" \
+    || { [[ $ORG == 1 ]] && has_registry_token "$FORGEJO_URL/api/v1/orgs/${REPO%%/*}/actions/secrets"; } \
+    || WAIT+=("secret REGISTRY_TOKEN (or <PREFIX>_REGISTRY_TOKEN, as in the project ci.yml) in ${REPO} or its organization: a Forgejo token of ${LOGIN} with scope write:package (CI pushes the image)")
 fi
 
 if [[ ${#WAIT[@]} -eq 0 ]]; then

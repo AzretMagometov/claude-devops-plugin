@@ -44,7 +44,8 @@ case "$1 $2" in
   *) exit 1 ;;
 esac
 EOF
-# curl: a GET answers an empty secret list, a PUT or POST saves its body to
+# curl: a GET of organization secrets answers $SHIM/org-secrets when it
+# exists, any other GET an empty list; a PUT or POST saves its body to
 # $SHIM/api-<last URL segment>; the arguments go to curl-args.log, the
 # contents of a header file (-H @file) to curl-headers.log.
 cat > "$T/bin/curl" <<'EOF'
@@ -57,13 +58,15 @@ done
 url=${*: -1}
 printf '%s\n' "$*" >> "$SHIM/curl-args.log"
 printf '%s %s\n' "$method" "$url" >> "$SHIM/curl.log"
-if [ "$method" = GET ]; then echo '[]'; else cat > "$SHIM/api-${url##*/}"; fi
+if [ "$method" = GET ]; then
+  case $url in */orgs/*/actions/secrets) cat "$SHIM/org-secrets" 2>/dev/null || echo '[]' ;; *) echo '[]' ;; esac
+else cat > "$SHIM/api-${url##*/}"; fi
 EOF
 chmod +x "$T/bin/"*
 
 # state <key=value...>: the facts the server reports.
 state() { printf '%s\n' web=1 "$@" "host_key=ssh-ed25519 AAAAhostkey" > "$T/state"; }
-reset() { rm -f "$T"/*.log "$T"/gh-DEPLOY_* "$T"/api-*; }
+reset() { rm -f "$T"/*.log "$T"/gh-DEPLOY_* "$T"/api-* "$T"/org-secrets; }
 
 # The project directory: a git repository, so the checkout of this plugin
 # never lends its own remote. remote URL sets origin, remote - removes it.
@@ -179,6 +182,21 @@ remote https://git.example.com/ops/demo.git
 run FORGEJO_API_TOKEN=tok DEVOPS_REGISTRY_LOGIN=ops
 no_registry_user() { ! has "REGISTRY_USER=" && test ! -e "$T/api-REGISTRY_USER"; }
 check "owner is the login: no REGISTRY_USER asked, no variable set" no_registry_user
+
+# An organization secret REGISTRY_TOKEN serves every repository of the
+# organization: nothing to ask for.
+reset; state "${ALL[@]}"
+echo '[{"name":"REGISTRY_TOKEN"}]' > "$T/org-secrets"
+remote https://git.example.com/acme/shop.git
+run FORGEJO_API_TOKEN=tok
+check "organization secret REGISTRY_TOKEN: DONE" grep -qx 'DONE demo@demo-host' <<<"$OUT"
+check "organization secret REGISTRY_TOKEN: read from the organization" \
+  logged "$T/curl.log" "GET https://git.example.com/api/v1/orgs/acme/actions/secrets"
+
+reset; state "${ALL[@]}"
+remote https://git.example.com/acme/shop.git
+run FORGEJO_API_TOKEN=tok
+check "no REGISTRY_TOKEN in the repository or the organization: asked for" has "WAIT 1" "scope write:package"
 
 reset; state "${ALL[@]}"
 remote https://git.example.com/acme/site.git
