@@ -11,6 +11,8 @@
 # with FORGEJO_API_TOKEN):
 #   REGISTRY         host of the Forgejo instance, e.g. git.example.com: the
 #                    registry of the image and the address of the sources
+#   REGISTRY_USER    optional: login of the REGISTRY_TOKEN owner; required when
+#                    the repository owner is an organization (set it by hand)
 #
 # Repository secrets (Settings → Actions → Secrets, or the API):
 #   REGISTRY_TOKEN   Forgejo token, scope write:package — pushes the image
@@ -120,6 +122,9 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
+      # github.repository keeps the case of the owner; a registry path is lower case.
+      - name: Lower-case the image path
+        run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
       - name: Fetch the sources
         env:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -134,9 +139,9 @@ jobs:
       - name: Log in to the registry
         env:
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
-          # The owner of the repository owns the token; an organization
-          # repository needs the login of the token owner here instead.
-          REGISTRY_USER: ${{ github.repository_owner }}
+          # An organization cannot log in: its repositories set the login of
+          # the token owner in the repository variable REGISTRY_USER.
+          REGISTRY_USER: ${{ vars.REGISTRY_USER || github.repository_owner }}
         run: printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
 
       # The docker-container driver can export the layer cache to the registry;
