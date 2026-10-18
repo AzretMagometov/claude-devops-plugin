@@ -175,8 +175,8 @@ What `deploy-app <app>` does on `ssh deployer@<host> "deploy <sha>"`:
 - copies its output to `state/deploy.log`.
 
 Tests: `scripts/deploy-app_test.sh` (parsing, lock, pre-deploy dump,
-compose policy; runs
-in a debian container on macOS), `scripts/migrate_test.sh` (the Alembic
+compose policy; runs as root in a throwaway debian container),
+`scripts/migrate_test.sh` (the Alembic
 migrate command against SQLite, in a python container),
 `scripts/config_test.sh` (`~/.config/devops/env` loading and missing keys),
 `scripts/add-project_test.sh` (both forges with ssh, gh and curl shims, no

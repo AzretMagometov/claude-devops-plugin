@@ -434,8 +434,9 @@ vet() {
   [[ -z $raw ]] || die "${what} reads files from the host: $(paste -sd, - <<< "$raw" | sed 's/,/, /g'); the image is the only source of the stack; ${after}"
 
   local json findings
-  json=$(compose "$tag" "$text" config --format json --no-env-resolution) && [[ -n $json ]] \
-    || die "${what} does not render; ${after}"
+  if ! json=$(compose "$tag" "$text" config --format json --no-env-resolution) || [[ -z $json ]]; then
+    die "${what} does not render; ${after}"
+  fi
   findings=$({
     jq "${JQ_ARGS[@]}" "$POLICY" <<< "$json"
     jq "${JQ_ARGS[@]}" "$BIND_SOURCES" <<< "$json" | while IFS=$'\t' read -r token src; do

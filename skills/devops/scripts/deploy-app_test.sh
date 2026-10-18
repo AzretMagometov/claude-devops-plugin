@@ -19,15 +19,19 @@
 # $COMPOSE_INPUTS. The raw compose check runs the real python3 and PyYAML.
 # The full rollout is covered by integration_test.sh.
 #
-# deploy-app writes to /opt/<app> and needs flock(1) from util-linux, jq
-# and python3 with PyYAML, so on a machine without them the tests re-run
-# themselves in a debian container, which installs jq and python3-yaml first.
+# deploy-app writes to /opt/<app>, needs flock(1) from util-linux, jq and
+# python3 with PyYAML, and the fixtures need root: the allow file must be
+# root's, and modes must come from the umask alone (a default ACL on the
+# host's /opt, as on GitHub runners, overrides it). So the tests always re-run
+# themselves as root in a throwaway debian container, which installs jq and
+# python3-yaml first; the skill is mounted read-only, everything the tests
+# write stays inside the container.
 #   bash deploy-app_test.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-if ! command -v flock >/dev/null || ! command -v jq >/dev/null || ! python3 -c 'import yaml' 2>/dev/null || [[ ! -w /opt ]]; then
-  exec docker run --rm -v "${HERE%/scripts}:/skill:ro" debian:13 bash -c \
+if [[ ${DEPLOY_APP_TEST_CONTAINER:-} != 1 ]]; then
+  exec docker run --rm -e DEPLOY_APP_TEST_CONTAINER=1 -v "${HERE%/scripts}:/skill:ro" debian:13 bash -c \
     'export DEBIAN_FRONTEND=noninteractive && apt-get -qq update && apt-get -qq install -y jq python3-yaml > /dev/null && exec bash /skill/scripts/deploy-app_test.sh'
 fi
 
