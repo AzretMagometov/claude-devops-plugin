@@ -133,11 +133,18 @@ Adapt the templates in `assets/` to the stack, do not copy them blindly:
   (`references/github-actions.md`; image `ghcr.io/<owner>/<repo>`);
 - Dockerfile: non-root user with a fixed UID, and
   `COPY docker-compose.yml /app/docker-compose.yml` — the deploy script reads
-  the compose file from the image;
+  the compose file from the image; every `FROM` and `COPY --from` image is
+  `name:tag@sha256:<digest>` (the Digest of
+  `docker buildx imagetools inspect <name:tag>`), else BuildKit asks the
+  registry on every build, and a stale login there fails it; no
+  `# syntax=` line (it pulls the frontend image); uv and pip download into
+  `RUN --mount=type=cache,target=/root/.cache/uv` with `ENV UV_LINK_MODE=copy`;
 - `.gitignore`: `.env`.
 
 Validate: `IMAGE=<registry>/<owner>/<app> docker compose --env-file <dummy env> config -q`
-(deploy-app passes `IMAGE` in the environment) and `actionlint`.
+(deploy-app passes `IMAGE` in the environment), `actionlint`, and
+`bash ${CLAUDE_SKILL_DIR}/scripts/dockerfile-pins.sh Dockerfile` (prints
+the lines without a digest pin).
 
 ## 3. Prepare the server
 
@@ -197,7 +204,9 @@ What `deploy-app <app>` does on `ssh deployer@<host> "deploy <sha>"`:
 - reads `IMAGE` (required, `<registry>/<owner>/<app>`), `REGISTRY_TOKEN`
   (required), `REGISTRY_USER` (default the `<owner>` of `IMAGE`) from `.env`;
   `add-project.sh` lists a missing `IMAGE` among the open items; logs in to the registry of `IMAGE`, pulls the tag
-  and resolves it to an image ID;
+  and resolves it to an image ID; the other images of the stack are pulled
+  only when missing (`compose pull --policy missing`): a third-party image
+  changes only when its tag or digest in the compose file changes;
 - reads the compose file once from that image ID (`/app/docker-compose.yml`,
   fallback `/opt/<app>/docker-compose.yml`) and gives the same bytes to every
   compose call, passes `IMAGE` and `IMAGE_TAG` in the environment, project
@@ -245,6 +254,7 @@ migrate command against SQLite, in a python container),
 server),
 `scripts/forge-check_test.sh` (both forges with curl and gh shims answering
 from fixtures, no forge),
+`scripts/dockerfile-pins_test.sh` (sample Dockerfiles),
 `scripts/integration_test.sh` (vps-init + web-init +
 add-project.sh + real rollouts in a local systemd container, ~10 min),
 `scripts/integration_vpn_test.sh` (vpn-deploy on a fresh container

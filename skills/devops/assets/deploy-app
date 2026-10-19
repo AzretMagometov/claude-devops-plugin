@@ -39,10 +39,13 @@
 # may name another image a minute later. After `docker pull` the tag is
 # resolved to its image ID once; the compose file is read once from that ID
 # (`docker run` of an ID never pulls) and kept in memory, and every compose
-# call of the run gets those bytes. After `compose pull`, which pulls the app
-# tag again with the rest of the stack, the tag must still name that ID: a
-# tag re-pushed in between stops the run before production changes. Every
-# other image of the stack is resolved to its ID after that pull too, its
+# call of the run gets those bytes. `compose pull --policy missing` pulls only
+# the images of the stack that are not on disk: a third-party image changes
+# only when its tag or digest in the compose file changes, and a deploy asks
+# Docker Hub nothing. After that pull the tag must still name that ID: a tag
+# moved in between (a pull of the same tag on the server) stops the run
+# before production changes. Every other image of the stack is resolved to
+# its ID after that pull too, its
 # labels are checked (below), and `up` gets a second compose file,
 # state/compose-pin.json, that sets each service's image to that ID: what
 # starts is what was checked, even if a later pull on the server (another
@@ -445,9 +448,9 @@ vet() {
   } | not_granted)
   [[ -z $findings ]] || die "${what} refused by the server policy: ${findings}; ${grant}; ${after}"
 
-  compose "$tag" "$text" pull --quiet || die "stack images for ${tag} did not download; ${after}"
+  compose "$tag" "$text" pull --quiet --policy missing || die "stack images for ${tag} did not download; ${after}"
   [[ $(image_id "${IMAGE}:${tag}") == "$id" ]] \
-    || die "image ${IMAGE}:${tag} changed in the registry during the ${phase} (was ${id}); ${after}"
+    || die "image ${IMAGE}:${tag} moved to another image during the ${phase} (was ${id}); ${after}"
 
   # Every image of the stack by ID, and its labels: {ref: id}, {ref: labels}.
   local ids='{}' labels='{}' refs ref ref_id ref_labels

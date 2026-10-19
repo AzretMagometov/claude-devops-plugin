@@ -21,10 +21,13 @@ commit hash. Nothing is rebuilt.
 
 ## Runner prerequisites
 
-The `test` job downloads nothing on a normal run: the image with uv is on the
-runner host, the packages are in a uv cache on the runner host, and the
-sources come as one archive from the Forgejo API. A slow route to pypi.org
-then costs time only on a cache miss. Do these steps once on the runner host.
+The `test` and `build` jobs download nothing on a normal run: the image with
+uv is on the runner host, the packages are in a uv cache on the runner host,
+the sources come from Forgejo, and trivy reads its DB from a cache volume
+that a daily timer fills. `build` reaches the network only for the sources
+and the registry push; a Dockerfile with digest pins (`SKILL.md`, step 2)
+needs no registry lookups for its base images. A slow route to pypi.org then
+costs time only on a cache miss. Do these steps once on the runner host.
 
 1. Build the job image from `assets/ci-image/Dockerfile`. It is
    `python:3.12-slim-bookworm`, the base of the application image, plus uv.
@@ -64,27 +67,31 @@ then costs time only on a cache miss. Do these steps once on the runner host.
    dependencies again. Look for that line in the runner log when the `test`
    job is slow.
 
-4. Bound the disk of the runner host with a weekly timer. The CI image has
-   the label `devops.keep`: no registry has it, so the prune skips it.
-   buildx keeps builders per user, so the service runs as the user of the
-   runner service (`User=` of its unit).
+4. Bound the disk of the runner host with a weekly timer. `docker image
+   prune -f` removes dangling images only: the `build` job removes the app
+   image after the push, and base, tool and service images stay, so no run
+   pulls them again. Do not add `-a --filter until=...`: `until` is the
+   creation time of the image, not the time of its last use, so it removes
+   trivy and the service images every week. The buildx prune keeps the cache
+   of the `ci` builder under 3 GB. buildx keeps builders per user, so the
+   service runs as the user of the runner service (`User=` of its unit).
 
    ```ini
-   # /etc/systemd/system/docker-image-prune.service
+   # /etc/systemd/system/ci-disk-prune.service
    [Unit]
-   Description=Remove Docker images and build cache older than a week
+   Description=Remove dangling Docker images and bound the build cache
    Requires=docker.service
    After=docker.service
 
    [Service]
    Type=oneshot
    User=<runner user>
-   ExecStart=/usr/bin/docker image prune -af --filter until=168h --filter label!=devops.keep
-   ExecStart=/usr/bin/docker buildx prune --builder ci -af --filter until=168h
+   ExecStart=/usr/bin/docker image prune -f
+   ExecStart=/usr/bin/docker buildx prune --builder ci -f --max-used-space 3gb
 
-   # /etc/systemd/system/docker-image-prune.timer
+   # /etc/systemd/system/ci-disk-prune.timer
    [Unit]
-   Description=Weekly docker image prune
+   Description=Weekly CI disk prune
 
    [Timer]
    OnCalendar=weekly
@@ -96,13 +103,56 @@ then costs time only on a cache miss. Do these steps once on the runner host.
    ```
 
    ```bash
-   systemctl daemon-reload && systemctl enable --now docker-image-prune.timer
+   systemctl daemon-reload && systemctl enable --now ci-disk-prune.timer
    ```
 
+   Replace an earlier unit (`docker-image-prune.*` or a script in
+   `/usr/local/bin/ci-disk-prune` with `image prune -af`) with this one.
    Builders of earlier template versions, one per repository, are not used
    any more: `docker buildx ls`, then `docker buildx rm <name>`.
 
-5. In Forgejo: every push adds a `:<sha>` version to the registry. Per owner
+5. Refresh the trivy DB with a daily timer. The `build` job scans with
+   `--skip-db-update` and fails at once when the volume `trivy-cache` has no
+   DB.
+
+   ```ini
+   # /etc/systemd/system/trivy-db-update.service
+   [Unit]
+   Description=Download the trivy vulnerability DB into the volume trivy-cache
+   Requires=docker.service
+   After=docker.service network-online.target
+   Wants=network-online.target
+
+   [Service]
+   Type=oneshot
+   User=<runner user>
+   ExecStart=/usr/bin/docker run --rm -v trivy-cache:/root/.cache/trivy aquasec/trivy:0.74.0 image --download-db-only --skip-version-check --disable-telemetry --no-progress
+
+   # /etc/systemd/system/trivy-db-update.timer
+   [Unit]
+   Description=Daily trivy DB update
+
+   [Timer]
+   OnCalendar=daily
+   Persistent=true
+   RandomizedDelaySec=1h
+
+   [Install]
+   WantedBy=timers.target
+   ```
+
+   ```bash
+   systemctl daemon-reload && systemctl enable --now trivy-db-update.timer
+   systemctl start trivy-db-update.service   # once by hand: the first DB
+   ```
+
+   The trivy tag in the unit and in `ci.yml` change together.
+
+6. A stale login to another registry in `~/.docker/config.json` of the
+   runner user (ghcr.io, say) breaks a build with 403 on an unpinned image:
+   `docker logout <registry>`. Digest pins avoid the request entirely.
+
+7. In Forgejo: every push adds a `:<sha>` version to the registry. Per owner
    (user or organization): Settings → Packages → Cleanup rules → add a rule:
    type `container`, keep the 5 most recent versions, remove pattern `.*`.
    Rollback (`image_tag`) reaches only the versions the rule keeps.
@@ -143,6 +193,12 @@ image with the cache mounted removes the entries no longer used.
   ci` and let the next run create the builder again.
 - The loaded `<image>:<sha>` is removed after the push, also on a failed run.
 - The image is scanned before it is pushed (`--load`, then trivy, then push).
+- trivy scans offline: `--skip-db-update --skip-java-db-update
+  --skip-check-update --skip-version-check --disable-telemetry
+  --offline-scan`. The DB comes from the volume `trivy-cache`, which the
+  timer `trivy-db-update` fills (prerequisite 5). With an empty volume trivy
+  says only "--skip-db-update cannot be specified on the first run", so a
+  step before the scans checks the volume and names the timer.
 - Step logs are not readable through the API (a web route with a CSRF token).
 
 ## Secrets and tokens

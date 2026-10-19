@@ -11,7 +11,8 @@
 # $CONFIGS/default.json, with @TAG@ replaced by the tag, and the real jq
 # checks it. `image inspect` answers the ID id-<tag of the reference>, and
 # id-repushed for the app image once `compose pull` of the tag in
-# FAKE_REPUSH ran: the registry got a new image under the same tag; asked for labels, it prints
+# FAKE_REPUSH ran: the tag on disk moved to another image during the pull
+# (another pull of the same tag on the server); asked for labels, it prints
 # $CONFIGS/labels-<ID without sha256:>.json, else null. `docker run` of an
 # image ID prints the compose file "x-compose-of: <ID>" when FAKE_COMPOSE is
 # set and fails otherwise (no compose in the image: /opt/demo/docker-compose.yml
@@ -556,8 +557,8 @@ check "invalid previous tag never comes up" test "$(grep -c ' up ' "$DOCKER_CALL
 # The compose that passed the policy is the one compose starts, and the app
 # image started is the one it came from: the tag resolves to an image ID
 # once, the compose is read once from that ID, and `up` never pulls. A tag
-# re-pushed in the registry during `compose pull` (the CI token writes
-# there) stops the run before `up`.
+# that names another image on disk after `compose pull` stops the run
+# before `up`.
 APPREF=git.example.com/ops/demo
 rm -f /opt/demo/state/last-known-good "$CONFIGS/$PREV.json"
 export FAKE_COMPOSE=1
@@ -568,14 +569,19 @@ check "compose read once" test "$(grep -c '^docker run ' "$DOCKER_CALLS")" = 1
 check "every compose call got the compose of that ID" \
   test "$(sort -u "$COMPOSE_INPUTS")" = "x-compose-of: sha256:id-$SHA"
 check "up never pulls" test -z "$(grep ' up ' "$DOCKER_CALLS" | grep -v -- ' --pull never ')"
+# A third-party image is pulled only when it is not on disk: no registry
+# lookup per deploy.
+check "compose pull only pulls missing images" \
+  test "$(grep -c '^docker compose .* pull ' "$DOCKER_CALLS")" -ge 1 -a \
+  -z "$(grep '^docker compose .* pull ' "$DOCKER_CALLS" | grep -v -- ' pull --quiet --policy missing')"
 
 export FAKE_REPUSH=$SHA
-case_ "tag re-pushed during compose pull: refused" 1 "${APPREF}:${SHA} changed in the registry during the rollout.*production untouched" demo
-check "re-pushed tag: no dump, no up" test -z "$(grep -E ' up |^pg_dump' "$DOCKER_CALLS")"
+case_ "tag moved during compose pull: refused" 1 "${APPREF}:${SHA} moved to another image during the rollout.*production untouched" demo
+check "moved tag: no dump, no up" test -z "$(grep -E ' up |^pg_dump' "$DOCKER_CALLS")"
 
 # Rollback: PREVIOUS is pulled explicitly (the weekly prune may have removed
-# it), its compose read once from its ID and checked, and a re-push of
-# PREVIOUS during the pull keeps it down.
+# it), its compose read once from its ID and checked, and a move of
+# PREVIOUS on disk during the pull keeps it down.
 echo "$PREV" > /opt/demo/state/last-known-good
 unset FAKE_REPUSH
 export FAKE_UP_TAGS=$PREV
@@ -586,9 +592,11 @@ check "rollback reads the compose of the PREVIOUS ID" \
 check "rollback compose calls got the compose of the PREVIOUS ID" \
   test "$(grep -c "x-compose-of: sha256:id-$PREV" "$COMPOSE_INPUTS")" -ge 3
 check "rollback up never pulls" grep -q " up .*--pull never.*\[$PREV\]" "$DOCKER_CALLS"
+check "rollback compose pull only pulls missing images" \
+  grep -q " pull --quiet --policy missing \[$PREV\]" "$DOCKER_CALLS"
 export FAKE_REPUSH=$PREV
-case_ "PREVIOUS re-pushed during its compose pull: no rollback" 1 "${APPREF}:${PREV} changed in the registry.*needs a human" demo
-check "re-pushed PREVIOUS never comes up" test -z "$(grep " up .*\[$PREV\]" "$DOCKER_CALLS")"
+case_ "PREVIOUS moved during its compose pull: no rollback" 1 "${APPREF}:${PREV} moved to another image.*needs a human" demo
+check "moved PREVIOUS never comes up" test -z "$(grep " up .*\[$PREV\]" "$DOCKER_CALLS")"
 unset FAKE_COMPOSE FAKE_REPUSH
 unset FAKE_DOCKER FAKE_UP_TAGS
 

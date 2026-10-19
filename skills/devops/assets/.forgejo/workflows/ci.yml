@@ -193,13 +193,28 @@ jobs:
             --load \
             .
 
+      # The scans below never download: the trivy DB timer on the runner host
+      # fills the cache volume once a day. On an empty volume trivy says only
+      # "--skip-db-update cannot be specified on the first run".
+      # See references/forgejo-actions.md, "Runner prerequisites".
+      - name: Check the vulnerability database
+        run: |
+          docker run --rm --entrypoint test \
+            -v trivy-cache:/root/.cache/trivy \
+            aquasec/trivy:0.74.0 -s /root/.cache/trivy/db/trivy.db \
+            || { echo "no trivy DB in the volume trivy-cache: on the runner host run systemctl start trivy-db-update.service"; exit 1; }
+
       # HIGH and CRITICAL go to the log and never fail the run.
+      # No request leaves the host: no DB or check update, no version check,
+      # no telemetry, no dependency lookups.
       - name: Report HIGH and CRITICAL vulnerabilities
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v trivy-cache:/root/.cache/trivy \
             aquasec/trivy:0.74.0 image \
+            --skip-db-update --skip-java-db-update --skip-check-update \
+            --skip-version-check --disable-telemetry --offline-scan \
             --severity HIGH,CRITICAL \
             --exit-code 0 \
             "${IMAGE}:${GITHUB_SHA}"
@@ -211,6 +226,8 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v trivy-cache:/root/.cache/trivy \
             aquasec/trivy:0.74.0 image \
+            --skip-db-update --skip-java-db-update --skip-check-update \
+            --skip-version-check --disable-telemetry --offline-scan \
             --ignore-unfixed \
             --severity CRITICAL \
             --exit-code 1 \

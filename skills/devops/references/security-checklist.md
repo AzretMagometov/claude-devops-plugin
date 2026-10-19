@@ -140,9 +140,11 @@ new project `demo_x` next to `demo`, or `demo` next to `demo_x`.
 
 The checked compose is the started one. `deploy-app` resolves the tag to an
 image ID after `docker pull`, reads the compose file from that ID once, and
-gives the same bytes to `config`, `pull` and `up`. After `compose pull` the
-tag must still name that ID: a tag pushed again in the meantime (the CI
-token writes to the registry) stops the run with "production untouched".
+gives the same bytes to `config`, `pull` and `up`. `compose pull --policy
+missing` pulls only the images not on disk, so it never pulls the app tag
+again. After it the tag must still name that ID: a tag moved in the meantime
+(a pull of the same tag on the server) stops the run with "production
+untouched".
 Every image of the stack is then resolved to its ID, and `up --pull never
 --no-build` gets `state/compose-pin.json`, which sets each service's image
 to that ID: a tag moved on the server after the check (another project

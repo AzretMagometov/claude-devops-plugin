@@ -15,6 +15,11 @@
 #            with a GC limit, no registry cache, an always-run step removes
 #            the loaded image; the job image carries the label that the
 #            runner-host prune skips
+#   trivy    both scans of the Forgejo `build` job run offline after a step
+#            that checks the DB volume and names the timer that fills it;
+#            the GitHub scans skip the version check and telemetry; the
+#            runner prerequisites carry the DB timer and a prune that keeps
+#            tagged images
 #
 #   bash ci-template_test.sh
 set -euo pipefail
@@ -69,6 +74,43 @@ always_rm() {
 }
 check "loaded image removed in an always-run step" always_rm
 check "job image carries the label devops.keep" grep -qx 'LABEL devops.keep=true' "$DOCKERFILE"
+
+# --- trivy -------------------------------------------------------------------
+# One line per command: continuation lines joined.
+joined() { awk '{ if (sub(/\\$/, "")) printf "%s", $0; else print }' <<<"$1"; }
+# scans <job text>: the `trivy image` scan commands, one per line.
+scans() { joined "$1" | grep -E 'aquasec/trivy:[^ ]+ +image ' || true; }
+# all_carry <job text> <flag...>: two scans, each with every flag.
+all_carry() {
+  local text=$1 line flag
+  shift
+  [[ $(scans "$text" | grep -c .) -eq 2 ]] || return 1
+  while IFS= read -r line; do
+    for flag in "$@"; do grep -qE -- "$flag( |$)" <<<"$line" || return 1; done
+  done <<<"$(scans "$text")"
+}
+check "forgejo build: both scans run offline" all_carry "$BUILD" \
+  --skip-db-update --skip-java-db-update --skip-check-update --skip-version-check \
+  --disable-telemetry --offline-scan
+# The guard reads the cache volume before the first scan and names the timer
+# that fills it.
+guard_first() {
+  local guard scan
+  guard=$(grep -n 'trivy-db-update' <<<"$BUILD" | head -1 | cut -d: -f1)
+  scan=$(grep -n 'aquasec/trivy:[^ ]* image' <<<"$BUILD" | head -1 | cut -d: -f1)
+  [[ -n $guard && -n $scan && $guard -lt $scan ]]
+}
+check "forgejo build: a DB guard names trivy-db-update before the scans" guard_first
+GH_WF=$SKILL/assets/.github/workflows/ci.yml
+GH_BUILD=$(awk '/^  build:$/ {on=1} /^  deploy:$/ {on=0} on' "$GH_WF" | grep -v '^[[:space:]]*#')
+check "github build: both scans skip the version check and telemetry" all_carry "$GH_BUILD" \
+  --skip-version-check --disable-telemetry
+DOC=$SKILL/references/forgejo-actions.md
+check "runner doc: a DB timer runs --download-db-only" \
+  grep -qE 'ExecStart=.*aquasec/trivy:[^ ]+ image --download-db-only' "$DOC"
+check "runner doc: the DB timer is trivy-db-update.timer" grep -q 'enable --now trivy-db-update.timer' "$DOC"
+check "runner doc: the prune keeps tagged images" \
+  test "$(sed -n 's/^ *\(ExecStart=.*docker image prune\)/\1/p' "$DOC")" = 'ExecStart=/usr/bin/docker image prune -f'
 
 # --- sources -----------------------------------------------------------------
 # The run: body of the step, dedented, exactly as the runner gets it.

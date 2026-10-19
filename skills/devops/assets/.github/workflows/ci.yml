@@ -150,12 +150,15 @@ jobs:
             .
 
       # HIGH and CRITICAL go to the log and never fail the run.
+      # A hosted runner starts empty, so trivy downloads its DB here; it skips
+      # only the version check and telemetry.
       - name: Report HIGH and CRITICAL vulnerabilities
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v trivy-cache:/root/.cache/trivy \
             aquasec/trivy:0.74.0 image \
+            --skip-version-check --disable-telemetry \
             --severity HIGH,CRITICAL \
             --exit-code 0 \
             "${IMAGE}:${GITHUB_SHA}"
@@ -167,6 +170,7 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v trivy-cache:/root/.cache/trivy \
             aquasec/trivy:0.74.0 image \
+            --skip-version-check --disable-telemetry \
             --ignore-unfixed \
             --severity CRITICAL \
             --exit-code 1 \
