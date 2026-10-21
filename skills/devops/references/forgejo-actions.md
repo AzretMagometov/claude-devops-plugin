@@ -200,6 +200,16 @@ image with the cache mounted removes the entries no longer used.
   says only "--skip-db-update cannot be specified on the first run", so a
   step before the scans checks the volume and names the timer.
 - Step logs are not readable through the API (a web route with a CSRF token).
+  They lie on the Forgejo host as
+  `<forgejo data>/actions_log/<owner>/<repo>/<xx>/<task id>.log.zst`
+  (`<forgejo data>` is `/var/lib/forgejo/data` for a package install); the
+  task id of each job is `id` in `GET /repos/{owner}/{repo}/actions/tasks`:
+
+  ```bash
+  ssh <DEVOPS_ADMIN>@<DEVOPS_REGISTRY> \
+    'sudo find /var/lib/forgejo/data/actions_log/<owner>/<repo> -name "<task id>.log.zst" -exec cat {} +' \
+    | zstd -dc
+  ```
 
 ## Secrets and tokens
 
