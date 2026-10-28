@@ -42,6 +42,7 @@ prune_active=1
 vpn_signal=
 auto_reboot=1
 env_image=myapp|1
+env_perms=myapp|root:deployer:640
 disk_used=41'
 
 # Facts of a VPN server: vps-init done, xray on 443 as a host process, no Docker.
@@ -136,7 +137,7 @@ case_ "auto-reboot on VPN"         "${VPS_OK/auto_reboot=0/auto_reboot=1}" '^LAY
 case_ "legacy facts: no auto-reboot keys" "$(grep -vE '^(vpn_signal|auto_reboot)=' <<<"$WEB_OK")" '^LAYER=web FAIL=0 ' 0 1
 case_ "fresh server: no auto-reboot WARN" "$FRESH" '^LAYER=none FAIL=0 ' 0 0
 case_ "web project without IMAGE" "${WEB_OK/env_image=myapp|1/env_image=myapp|0}" '^LAYER=web FAIL=0 PROJECTS=myapp$' 0 1
-case_ "web project without .env"  "${WEB_OK/env_image=myapp|1/env_image=myapp|}" '^LAYER=web FAIL=0 ' 0 0
+case_ "web project without .env"  "$(grep -v '^env_perms=' <<<"${WEB_OK/env_image=myapp|1/env_image=myapp|}")" '^LAYER=web FAIL=0 ' 0 0
 case_ "vps layer: no IMAGE check" "$VPS_OK
 env_image=myapp|0" '^LAYER=vps FAIL=0 ' 0 0
 
@@ -158,6 +159,31 @@ image_warn() {  # image_warn <name> <expected IMAGE value> <env assignments...>
 image_warn "IMAGE hint: generic form"  "<registry>/<owner>/myapp"
 image_warn "IMAGE hint: Forgejo"       "registry.example/acme/myapp" DEVOPS_REGISTRY=registry.example DEVOPS_REGISTRY_USER=acme
 image_warn "IMAGE hint: GitHub"        "ghcr.io/acme/myapp" DEVOPS_FORGE=github DEVOPS_REGISTRY_USER=Acme
+
+# .env drifts from root:deployer 640 when recreated by hand (nano, cp): the
+# WARN names the found state and gives the command that restores it.
+FIX="sudo chown root:deployer /opt/myapp/.env && sudo chmod 640 /opt/myapp/.env"
+perms_warn() {  # perms_warn <name> <owner:group:mode> <expected WARN line, empty for none>
+  local name=$1 want=$3 out line
+  printf '%s\n' "${WEB_OK/env_perms=myapp|root:deployer:640/env_perms=myapp|$2}" > "$TMP/facts"
+  out=$(DEVOPS_CONFIG=/dev/null DEVOPS_ADMIN=ops CHECK_FACTS_FILE="$TMP/facts" bash "$CHECK" test-host || true)
+  line=$(grep '^  WARN  ' <<<"$out" || true)
+  if [[ $line == "${want:+  WARN  $want}" && $(tail -n1 <<<"$out") == "LAYER=web FAIL=0 PROJECTS=myapp" ]]; then
+    echo "ok   $name"
+  else
+    echo "FAIL $name: got «${line}», last line: $(tail -n1 <<<"$out")"
+    FAILED=$((FAILED + 1))
+  fi
+}
+perms_warn ".env root:deployer 640"  root:deployer:640 ""
+perms_warn ".env 644: world-readable" root:deployer:644 \
+  "myapp: /opt/myapp/.env is root:deployer 644, readable by every user on the server: $FIX"
+perms_warn ".env root:root 600"      root:root:600 \
+  "myapp: /opt/myapp/.env is root:root 600, not root:deployer 640: $FIX"
+perms_warn ".env owned by deployer"  deployer:deployer:640 \
+  "myapp: /opt/myapp/.env is deployer:deployer 640, not root:deployer 640: $FIX"
+case_ "vps layer: no .env perms check" "$VPS_OK
+env_perms=myapp|root:root:644" '^LAYER=vps FAIL=0 ' 0 0
 
 # vps-init and check.sh carry the same vpn_signal(): the remote heredocs
 # cannot source a shared file, so the copies must stay identical.

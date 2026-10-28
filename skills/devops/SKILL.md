@@ -168,7 +168,9 @@ bash ${CLAUDE_SKILL_DIR}/scripts/add-project.sh <host> <app>
 - ownership `root:deployer 640` on `/opt/<app>/.env` when it is there. It
   does not create the file: the user sends it over ssh stdin
   (`sudo install -m 640 -o root -g deployer /dev/stdin /opt/<app>/.env`),
-  the secrets-keeper skill generates the values that can be generated;
+  the secrets-keeper skill generates the values that can be generated.
+  A file recreated by hand (`nano`, `cp`) drifts to 644; `check.sh` prints
+  a WARN with the `chown`/`chmod` that restores it;
 - a fresh ed25519 key, one line per project in
   `/home/deployer/.ssh/authorized_keys`, found by its comment:
   `restrict,command="/usr/local/bin/deploy-app <app>" ssh-ed25519 AAAA… <app>-deploy@<forge>`.

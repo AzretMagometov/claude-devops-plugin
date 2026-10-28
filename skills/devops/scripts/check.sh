@@ -10,7 +10,8 @@
 # error. A present anchor with a failed assertion means the layer is broken.
 # The vps layer also compares auto-reboot with VPN detection; a mismatch is a
 # WARN line, not counted in FAIL. On LAYER=web a project whose /opt/<app>/.env
-# has no IMAGE line is a WARN too: deploy-app cannot roll it out.
+# has no IMAGE line is a WARN too: deploy-app cannot roll it out. So is a .env
+# that is not root:deployer 640, as add-project.sh leaves it.
 # Two findings are errors on any layer: a container other than Traefik that
 # publishes a port on all interfaces, and a container other than socket-proxy
 # that mounts the Docker socket.
@@ -95,10 +96,13 @@ if systemctl is-active -q docker 2>/dev/null; then
       sock=$(docker inspect -f '{{range .Mounts}}{{.Source}} {{end}}' "${line%%|*}" | tr ' ' '\n' | grep -m1 'docker\.sock$')
       f container "${line#*|}|$sock"
     done
-  # Only whether IMAGE is set: the rest of .env stays on the server.
+  # Only whether IMAGE is set and the ownership: the rest of .env stays on the server.
   docker ps --format '{{.Label "com.docker.compose.project"}}' | sort -u | while read -r p; do
     case $p in ''|traefik|*[!a-z0-9_-]*) continue ;; esac
-    if [ -f "/opt/$p/.env" ]; then f env_image "$p|$(yn grep -qE '^IMAGE=.+' "/opt/$p/.env")"; else f env_image "$p|"; fi
+    if [ -f "/opt/$p/.env" ]; then
+      f env_image "$p|$(yn grep -qE '^IMAGE=.+' "/opt/$p/.env")"
+      f env_perms "$p|$(stat -c '%U:%G:%a' "/opt/$p/.env")"
+    else f env_image "$p|"; fi
   done
 fi
 
@@ -230,6 +234,14 @@ if is web_anchor 1; then
   # Legacy projects predate IMAGE in .env; the new deploy-app stops without it.
   [ $layer != web ] || facts env_image | while IFS='|' read -r app set; do
     [ "$set" != 0 ] || warn "$app: no IMAGE in /opt/$app/.env, deploy-app cannot roll out without it: add IMAGE=$(devops_image "$app")"
+  done
+  # A .env recreated by hand (nano, cp) loses root:deployer 640 without a sign.
+  [ $layer != web ] || facts env_perms | while IFS='|' read -r app perms; do
+    [ "$perms" != root:deployer:640 ] || continue
+    env=/opt/$app/.env mode=${perms##*:}
+    fix="sudo chown root:deployer $env && sudo chmod 640 $env"
+    if (( 8#${mode: -1} & 4 )); then warn "$app: $env is ${perms%:*} $mode, readable by every user on the server: $fix"
+    else warn "$app: $env is ${perms%:*} $mode, not root:deployer 640: $fix"; fi
   done
 else
   note "not installed: no /opt/traefik/compose.yml"
