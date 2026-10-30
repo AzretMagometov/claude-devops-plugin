@@ -74,6 +74,18 @@ CONFIG=$CONF_DIR/config.json
 ENV=$CONF_DIR/client.env
 PORT=443
 FRESH=0
+LOG_DIR=/var/log/xray
+LOG_FILE=$LOG_DIR/error.log
+
+ensure_xray_log_permissions() {
+  install -d "$LOG_DIR"
+  chown xray:xray "$LOG_DIR"
+  chmod 750 "$LOG_DIR"
+  if [ -e "$LOG_FILE" ]; then
+    chown xray:xray "$LOG_FILE"
+    chmod 640 "$LOG_FILE"
+  fi
+}
 
 if [ ! -f "$ENV" ]; then
   FRESH=1
@@ -114,6 +126,7 @@ if [ ! -f "$ENV" ]; then
   }' > "$CONFIG"
   xray run -test -c "$CONFIG" >/dev/null
   chown root:xray "$CONFIG"; chmod 640 "$CONFIG"
+  ensure_xray_log_permissions
 
   printf 'SERVER_IP=%s\nPORT=%s\nSNI=%s\nPUBLIC_KEY=%s\nSHORT_ID=%s\n' "$SERVER_IP" "$PORT" "$SNI" "$PUB" "$SID" > "$ENV"
   chmod 600 "$ENV"
@@ -126,6 +139,7 @@ fi
 # The service runs as xray:xray, so it must be able to read the private-key config.
 chown root:xray "$CONFIG"
 chmod 640 "$CONFIG"
+ensure_xray_log_permissions
 if ! systemctl is-active --quiet xray; then
   systemctl restart xray
 fi
