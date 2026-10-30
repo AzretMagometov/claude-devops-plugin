@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Create N new VLESS and AmneziaWG users and print an archive download command.
+set -euo pipefail
+f=$0; while [ -L "$f" ]; do t=$(readlink "$f"); case $t in /*) f=$t ;; *) f=$(dirname "$f")/$t ;; esac; done
+SKILL_DIR=$(cd "$(dirname "$f")/.." && pwd)
+# shellcheck source=SCRIPTDIR/../lib/config.sh
+. "$SKILL_DIR/lib/config.sh"
+devops_require DEVOPS_ADMIN
+[ "$#" -eq 2 ] || { echo 'usage: vpn-users <IP or SSH alias> <new user count>' >&2; exit 1; }
+HOST=$1 COUNT=$2
+[[ $HOST =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo 'Invalid SSH host' >&2; exit 1; }
+[[ $COUNT =~ ^[1-9][0-9]{0,2}$ ]] && [ "$COUNT" -le 250 ] || { echo 'Count must be between 1 and 250' >&2; exit 1; }
+SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "$DEVOPS_ADMIN@$HOST")
+remote_dir=$("${SSH[@]}" 'umask 077; mktemp -d')
+[[ $remote_dir =~ ^/tmp/[A-Za-z0-9._-]+$ ]] || { echo 'Unexpected temporary directory' >&2; exit 1; }
+cleanup() { "${SSH[@]}" "rm -f '$remote_dir/vpn-users-server.py' '$remote_dir/awg-link.py'; rmdir '$remote_dir'" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+COPYFILE_DISABLE=1 tar -C "$SKILL_DIR/scripts" -cf - vpn-users-server.py awg-link.py | "${SSH[@]}" "tar -xf - -C '$remote_dir'"
+result=$("${SSH[@]}" "sudo -n env PYTHONDONTWRITEBYTECODE=1 python3 '$remote_dir/vpn-users-server.py' '$COUNT'")
+printf '%s\n' "$result"
+archive=$(printf '%s\n' "$result" | sed -n 's/^ARCHIVE=//p')
+[[ $archive =~ ^/var/lib/vpn-users/exports/vpn-users-[A-Za-z0-9.-]+\.tar\.gz$ ]] || { echo 'Unexpected archive path' >&2; exit 1; }
+filename=${archive##*/}
+printf '\nDownload the archive with:\n'
+printf 'umask 077; ssh %q %q > %q\n' "$DEVOPS_ADMIN@$HOST" "sudo -n cat '$archive'" "$filename"

@@ -281,3 +281,13 @@ It exports a native `.conf` and an AmneziaVPN `.vpn` key under
 The command requires Git and Go 1.25 or later locally, creates one client,
 and does not migrate existing AmneziaWG installations. Test the connection
 from a device after installation. Both files contain private credentials.
+
+### Add VPN users
+
+Run `vpn-users <IP or SSH alias> <count>` on your computer to add new users
+to an initialized Xray and AmneziaWG server. The command uses `DEVOPS_ADMIN`
+and server-side sudo. It prints an SSH command to download a `.tar.gz` archive.
+Each user directory contains a VLESS link and QR code, and AmneziaWG `.conf`
+and `.vpn` files. The count adds users to the existing total. The archive
+contains private credentials; keep it private and remove it when no longer
+needed.

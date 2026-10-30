@@ -74,6 +74,27 @@ an existing protocol or reissue another server's users without an explicit
 migration request. Check the actual tunnel from a separate device or network;
 `systemctl is-active` and a listening UDP port do not prove connectivity.
 
+## Add VPN users
+
+On a node with Xray and the AmneziaWG setup above, run:
+
+```bash
+bin/vpn-users <IP or SSH alias> <count>
+```
+
+`count` is the number of new users, not the final total. The command uses
+`DEVOPS_ADMIN` for SSH and `sudo -n` for server changes. It allocates a
+separate VLESS UUID and an AmneziaWG key and address for each user. It does
+not restart either service. Existing users and profiles are kept. The
+command prints a ready-to-run SSH command to download one `.tar.gz` archive.
+The archive has a directory per user containing `vless.txt`, `vless.png`,
+`amneziawg.conf` and `amneziawg.vpn`. Use `.vpn` in AmneziaVPN. The server
+keeps the archive under `/var/lib/vpn-users/exports/`, owned by root with
+mode 600. Treat the archive and extracted files as credentials. Delete the
+archive after distribution when it is no longer needed. The command uses an
+exclusive lock and rolls back newly created users on a reported error. If a
+rollback reports a failure, inspect both services before retrying.
+
 ## 1. Check the server
 
 ```bash
