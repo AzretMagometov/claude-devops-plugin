@@ -46,7 +46,11 @@ required key stops the script with the key name and the file path.
 
 A VPN server goes through `vpn-deploy`, not `web-init`. It runs `vps-init`,
 then installs xray and removes the 04:00 auto-reboot that `vps-init` set
-before xray existed.
+before xray existed. It records a fingerprint of `vps-init` and its settings
+on the server, then skips that step on reruns while the fingerprint matches.
+For older deployments, it records completion once when it finds an existing
+Xray client config. It checks Xray dependencies and installs only missing
+packages.
 
 ## 1. Check the server
 

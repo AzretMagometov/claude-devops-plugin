@@ -20,8 +20,11 @@ rolls back to the last healthy tag if a health check fails.
 
 A VPN server takes another path. `vpn-deploy <IP> <clients>` runs `vps-init`,
 installs xray with VLESS Reality, creates the clients, and downloads their
-links and QR codes to `~/vpn-configs/<IP>`. A VPN server gets no web layer and
-no automatic reboot.
+links and QR codes to `~/vpn-configs/<IP>`. It stores a fingerprint of the
+`vps-init` script and its settings on the server. A rerun skips that step while
+the fingerprint matches. On older deployments, an existing Xray client config
+seeds this history once. It installs only missing Xray dependencies. A VPN
+server gets no web layer and no automatic reboot.
 
 `skills/devops/scripts/check.sh <host>` reads which layers a server has and
 whether they still hold. The skill uses its last line to pick the next step.
