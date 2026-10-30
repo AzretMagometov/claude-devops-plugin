@@ -76,12 +76,20 @@ if [ ! -f "$ENV" ]; then
     ]}
   }' > "$CONFIG"
   xray run -test -c "$CONFIG" >/dev/null
-  chown root:nogroup "$CONFIG"; chmod 640 "$CONFIG"
+  chown root:xray "$CONFIG"; chmod 640 "$CONFIG"
 
   printf 'SERVER_IP=%s\nPORT=%s\nSNI=%s\nPUBLIC_KEY=%s\nSHORT_ID=%s\n' "$SERVER_IP" "$PORT" "$SNI" "$PUB" "$SID" > "$ENV"
   chmod 600 "$ENV"
   ufw allow "$PORT/tcp" >/dev/null
   systemctl enable -q xray
+  systemctl restart xray
+fi
+
+# Recover a first run that stopped after writing client.env but before Xray started.
+# The service runs as xray:xray, so it must be able to read the private-key config.
+chown root:xray "$CONFIG"
+chmod 640 "$CONFIG"
+if ! systemctl is-active --quiet xray; then
   systemctl restart xray
 fi
 
@@ -123,7 +131,7 @@ commit() {
   local tmp; tmp=$(mktemp --suffix=.json)
   printf '%s\n' "$1" > "$tmp"
   xray run -test -c "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "the new config failed validation, changes not applied"; }
-  chown root:nogroup "$tmp"; chmod 640 "$tmp"
+  chown root:xray "$tmp"; chmod 640 "$tmp"
   mv "$tmp" "$CONFIG"
 }
 
@@ -136,8 +144,11 @@ add() {
   # port is required: without it adu prints "Added 0 user(s)" and still exits 0
   jq -n --arg t "$TAG" --argjson p "$PORT" --arg id "$id" --arg f "$FLOW" --arg n "$name" \
     '{inbounds: [{tag: $t, port: $p, protocol: "vless", settings: {clients: [{id: $id, flow: $f, email: $n}], decryption: "none"}}]}' > "$tmp"
-  if ! xray api adu -s "$API" "$tmp" 2>&1 | grep -q 'Added 1 user'; then
-    rm -f "$tmp"; die "xray api adu did not add '$name': is xray running?"
+  local result
+  if ! result=$(xray api adu -s "$API" "$tmp" 2>&1) || ! grep -q 'Added 1 user' <<<"$result"; then
+    rm -f "$tmp"
+    [ -z "$result" ] || printf '%s\n' "$result" >&2
+    die "xray api adu did not add '$name'"
   fi
   rm -f "$tmp"
   commit "$(jq --arg t "$TAG" --arg id "$id" --arg f "$FLOW" --arg n "$name" \
