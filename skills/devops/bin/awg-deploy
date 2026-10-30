@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Install AmneziaWG 3.1 alongside an existing VPN and export one client.
+set -euo pipefail
+f=$0; while [ -L "$f" ]; do t=$(readlink "$f"); case $t in /*) f=$t ;; *) f=$(dirname "$f")/$t ;; esac; done
+SKILL_DIR=$(cd "$(dirname "$f")/.." && pwd)
+# shellcheck source=SCRIPTDIR/../lib/config.sh
+. "$SKILL_DIR/lib/config.sh"
+devops_require DEVOPS_ADMIN
+[ "$#" -eq 1 ] || { echo 'usage: awg-deploy <IPv4 address>' >&2; exit 1; }
+HOST=$1
+python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$HOST" || exit 1
+SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "$DEVOPS_ADMIN@$HOST")
+OUT=$HOME/vpn-configs/$HOST/amneziawg
+umask 077
+mkdir -p "$OUT"
+if ! "${SSH[@]}" 'sudo test -f /etc/amnezia/amneziawg/awg0.conf && sudo test -f /var/lib/awg-clients/user-01.conf'; then
+  for tool in go git; do command -v "$tool" >/dev/null || { echo "$tool is required locally" >&2; exit 1; }; done
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  git clone --quiet https://github.com/amnezia-vpn/amneziawg-go.git "$work/go"
+  git -C "$work/go" checkout -q b5928efb6ca19f0153958460c3d141f04abc5c2e
+  (cd "$work/go" && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "$work/amneziawg-go" .)
+  remote_work=$("${SSH[@]}" "mktemp -d")
+  trap '"${SSH[@]}" "rm -rf $remote_work" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+  scp -q "$work/amneziawg-go" "$DEVOPS_ADMIN@$HOST:$remote_work/amneziawg-go"
+  "${SSH[@]}" "sudo SERVER_IP=$HOST AWG_BINARY=$remote_work/amneziawg-go bash -s" < "$SKILL_DIR/scripts/awg-server-install.sh"
+fi
+"${SSH[@]}" 'sudo systemctl is-active --quiet awg-quick@awg0 && sudo test -f /var/lib/awg-clients/user-01.conf'
+"${SSH[@]}" 'sudo cat /var/lib/awg-clients/user-01.conf' > "$OUT/user-01.conf"
+python3 "$SKILL_DIR/scripts/awg-link.py" "$OUT/user-01.conf" > "$OUT/user-01.vpn"
+chmod 600 "$OUT/user-01.conf" "$OUT/user-01.vpn"
+echo "AmneziaWG profile: $OUT/user-01.vpn"

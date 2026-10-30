@@ -272,3 +272,12 @@ bash .githooks/pre-commit_test.sh
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+### AmneziaWG 3.1 alongside VLESS
+
+On an initialized Ubuntu 24.04 x86-64 VPN node, run `awg-deploy <IPv4>`.
+It exports a native `.conf` and an AmneziaVPN `.vpn` key under
+`~/vpn-configs/<IP>/amneziawg/`. Import the `.vpn` key in AmneziaVPN.
+The command requires Git and Go 1.25 or later locally, creates one client,
+and does not migrate existing AmneziaWG installations. Test the connection
+from a device after installation. Both files contain private credentials.

@@ -44,13 +44,35 @@ Forgejo API token from the keychain). An environment variable of the same
 name wins over the file; `DEVOPS_CONFIG` points to another file. A missing
 required key stops the script with the key name and the file path.
 
-A VPN server goes through `vpn-deploy`, not `web-init`. It runs `vps-init`,
+For VLESS, a VPN server goes through `vpn-deploy`, not `web-init`. It runs `vps-init`,
 then installs xray and removes the 04:00 auto-reboot that `vps-init` set
 before xray existed. It records a fingerprint of `vps-init` and its settings
 on the server, then skips that step on reruns while the fingerprint matches.
 For older deployments, it records completion once when it finds an existing
 Xray client config. It checks Xray dependencies and installs only missing
 packages.
+
+## AmneziaWG alongside VLESS
+
+For an Ubuntu 24.04 x86-64 VPN node already prepared with `vps-init`,
+`bin/awg-deploy <IPv4>` installs AmneziaWG 3.1 alongside Xray. It requires
+Go 1.25 or newer and Git on the local machine and uses TCP SSH, UDP 51820,
+IPv4 subnet 10.77.0.0/24 and the server's default outbound interface. It
+stops if another AWG installation or the UDP port is already in use; it
+does not migrate existing AWG servers or their clients. It creates one
+client and reuses it on a rerun. The server uses the pinned official
+userspace implementation and tools, with IPv4 forwarding and NAT.
+
+The output directory `~/vpn-configs/<IP>/amneziawg/` contains
+`user-01.conf` for compatible native clients and `user-01.vpn` for
+AmneziaVPN. Prefer the `.vpn` key for AmneziaVPN: in the verified 5.0.3
+macOS installation, importing `.conf` lost the 3.1 header protection and
+padding parameters, preventing the handshake. Generate the `.vpn` with
+`scripts/awg-link.py`; it is a credential and must stay private. A new
+client app does not upgrade existing 2.0 servers: never remove or upgrade
+an existing protocol or reissue another server's users without an explicit
+migration request. Check the actual tunnel from a separate device or network;
+`systemctl is-active` and a listening UDP port do not prove connectivity.
 
 ## 1. Check the server
 

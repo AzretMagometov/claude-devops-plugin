@@ -49,6 +49,7 @@ jobs:
         # of setup: they run by hand. deploy-app_test.sh and migrate_test.sh
         # start their own Docker containers.
         run: |
+          python3 -m unittest discover -s skills/devops/tests
           failed=()
           for t in skills/devops/scripts/*_test.sh .githooks/pre-commit_test.sh; do
             [[ $(basename "$t") == integration_* ]] && continue
